@@ -48,12 +48,22 @@ pub async fn update(pool: &SqlitePool, id: i64, title: &str, content: &str) -> R
     Ok(())
 }
 
-#[allow(dead_code)]
 pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
+    // 显式清理关联数据，避免依赖 SQLite 每条连接的 foreign_keys PRAGMA 状态。
+    let mut transaction = pool.begin().await?;
+    sqlx::query("DELETE FROM reviews WHERE card_id IN (SELECT id FROM cards WHERE note_id = ?1)")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM cards WHERE note_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
     sqlx::query("DELETE FROM notes WHERE id = ?1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 

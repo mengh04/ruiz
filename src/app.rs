@@ -1,5 +1,5 @@
 use gpui::{AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size};
-use gpui_component::Root;
+use gpui_component::{Root, TitleBar};
 use gpui_platform::application;
 
 use crate::assets::Assets;
@@ -61,9 +61,13 @@ pub fn run() {
                 WindowOptions {
                     titlebar: Some(TitlebarOptions {
                         title: Some("Ruiz".into()),
-                        ..Default::default()
+                        ..TitleBar::title_bar_options()
                     }),
                     window_bounds: Some(bounds),
+                    #[cfg(target_os = "linux")]
+                    window_background: gpui::WindowBackgroundAppearance::Transparent,
+                    #[cfg(target_os = "linux")]
+                    window_decorations: Some(gpui::WindowDecorations::Client),
                     ..Default::default()
                 },
                 |window, cx| {

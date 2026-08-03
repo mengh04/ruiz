@@ -13,8 +13,9 @@ use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::skeleton::Skeleton;
+use gpui_component::spinner::Spinner;
 use gpui_component::theme::{ActiveTheme as _, ThemeColor};
-use gpui_component::{Icon, IconName, StyledExt as _, h_flex, v_flex};
+use gpui_component::{Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::ai::judge::Judgement;
 use crate::assets::RuizIcon;
@@ -29,6 +30,7 @@ enum Phase {
     Loading,
     Answering,
     Judging,
+    Scheduling,
     Judged {
         judgement: Judgement,
         next: NextStates,
@@ -202,8 +204,13 @@ impl ReviewView {
         let pool = AppState::global(cx).pool.clone();
         let user_answer = self.submitted_answer.clone();
         let feedback = judgement.feedback.clone();
+        let retry_judgement = judgement.clone();
+        let retry_next = next.clone();
         let answer_input = self.answer.clone();
         let window_handle = self.window;
+        self.phase = Phase::Scheduling;
+        self.error = None;
+        cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
@@ -240,6 +247,10 @@ impl ReviewView {
                         }
                         Err(e) => {
                             this.update(&mut cx, |this, cx| {
+                                this.phase = Phase::Judged {
+                                    judgement: retry_judgement,
+                                    next: retry_next,
+                                };
                                 this.error = Some(format!("保存复习记录失败: {e}"));
                                 cx.notify();
                             })
@@ -254,8 +265,9 @@ impl ReviewView {
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
+        let compact = window.viewport_size().width.as_f32() < 900.;
 
         let error = self.error.clone().map(|e| {
             Alert::error("review-alert", e)
@@ -276,6 +288,8 @@ impl Render for ReviewView {
                     .icon(IconName::Redo2)
                     .label("刷新队列")
                     .outline()
+                    .loading(matches!(self.phase, Phase::Loading))
+                    .disabled(matches!(self.phase, Phase::Loading))
                     .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
                     .into_any_element(),
             ),
@@ -297,7 +311,7 @@ impl Render for ReviewView {
                             h_flex()
                                 .items_center()
                                 .gap_2()
-                                .child(Icon::new(RuizIcon::BrainCircuit).size_4())
+                                .child(Spinner::new().small())
                                 .child("正在准备复习队列"),
                         )
                         .child(Skeleton::new().w_2_3())
@@ -337,7 +351,7 @@ impl Render for ReviewView {
                             h_flex()
                                 .items_center()
                                 .gap_2()
-                                .child(Icon::new(RuizIcon::Sparkles).size_4())
+                                .child(Spinner::new().small().color(colors.primary))
                                 .child("AI 正在评估答案"),
                         )
                         .child(
@@ -347,6 +361,31 @@ impl Render for ReviewView {
                                 .child("正在对比问题、标准答案和你的作答，请稍候。"),
                         )
                         .child(Skeleton::new().w_full())
+                        .child(Skeleton::new().secondary().w_3_5()),
+                ),
+            Phase::Scheduling => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    GroupBox::new()
+                        .outline()
+                        .w_full()
+                        .max_w(px(560.))
+                        .title(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Spinner::new().small().color(colors.primary))
+                                .child("正在安排下次复习"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(colors.muted_foreground)
+                                .child("正在保存本次结果，并更新 FSRS 记忆状态。"),
+                        )
                         .child(Skeleton::new().secondary().w_3_5()),
                 ),
             Phase::Answering | Phase::Judged { .. } => {
@@ -361,6 +400,7 @@ impl Render for ReviewView {
                             .items_center()
                             .justify_between()
                             .gap_3()
+                            .flex_wrap()
                             .child(
                                 h_flex()
                                     .items_center()
@@ -463,11 +503,10 @@ impl Render for ReviewView {
                             .child(
                                 v_flex()
                                     .gap_1()
-                                    .child(
-                                        div()
-                                            .font_medium()
-                                            .child(SharedString::from(judgement.rating.clone())),
-                                    )
+                                    .child(div().font_medium().child(format!(
+                                        "AI 建议：{}",
+                                        rating_name(&judgement.rating)
+                                    )))
                                     .child(
                                         div()
                                             .text_sm()
@@ -483,21 +522,25 @@ impl Render for ReviewView {
                                         cx,
                                         Rating::Again,
                                         format!("重来 · {}", interval_label(next.again.interval)),
+                                        judgement.rating == "again",
                                     ))
                                     .child(rating_button(
                                         cx,
                                         Rating::Hard,
                                         format!("困难 · {}", interval_label(next.hard.interval)),
+                                        judgement.rating == "hard",
                                     ))
                                     .child(rating_button(
                                         cx,
                                         Rating::Good,
                                         format!("良好 · {}", interval_label(next.good.interval)),
+                                        judgement.rating == "good",
                                     ))
                                     .child(rating_button(
                                         cx,
                                         Rating::Easy,
                                         format!("简单 · {}", interval_label(next.easy.interval)),
+                                        judgement.rating == "easy",
                                     )),
                             ),
                     )
@@ -515,11 +558,12 @@ impl Render for ReviewView {
                             .child(Icon::new(IconName::SquareTerminal).size_4())
                             .child("你的回答"),
                     )
-                    .child(Input::new(&self.answer))
+                    .child(Input::new(&self.answer).h(px(180.)))
                     .child(
                         h_flex()
                             .justify_between()
                             .gap_2()
+                            .flex_wrap()
                             .child(
                                 Button::new("btn-show-source")
                                     .icon(if self.show_source {
@@ -556,7 +600,8 @@ impl Render for ReviewView {
                     .w_full()
                     .max_w(px(880.))
                     .mx_auto()
-                    .p_6()
+                    .when(compact, |this| this.p_4())
+                    .when(!compact, |this| this.p_6())
                     .gap_4()
                     .child(
                         h_flex()
@@ -633,10 +678,21 @@ fn interval_label(days: f32) -> String {
     }
 }
 
+fn rating_name(rating: &str) -> &'static str {
+    match rating {
+        "again" => "重来",
+        "hard" => "困难",
+        "good" => "良好",
+        "easy" => "简单",
+        _ => "由你决定",
+    }
+}
+
 fn rating_button(
     cx: &mut Context<ReviewView>,
     rating: Rating,
     label: impl Into<SharedString>,
+    recommended: bool,
 ) -> impl IntoElement {
     let id = match rating {
         Rating::Again => "rate-again",
@@ -650,6 +706,11 @@ fn rating_button(
         Rating::Good => IconName::ThumbsUp,
         Rating::Easy => IconName::Star,
     };
+    let icon = if recommended {
+        Icon::new(RuizIcon::Sparkles)
+    } else {
+        Icon::new(icon)
+    };
     let mut button = Button::new(id).icon(icon).label(label);
     button = match rating {
         Rating::Again => button.danger(),
@@ -657,5 +718,8 @@ fn rating_button(
         Rating::Good => button.success(),
         Rating::Easy => button.primary(),
     };
+    if !recommended {
+        button = button.outline();
+    }
     button.on_click(cx.listener(move |this, _, _, cx| this.rate(rating, cx)))
 }

@@ -32,4 +32,5 @@ sqlx = { version = "0.9", default-features = false, features = [
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

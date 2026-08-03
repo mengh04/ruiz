@@ -1,4 +1,4 @@
-use gpui::{Context, IntoElement, Render, prelude::*, px};
+use gpui::{Context, IntoElement, Render, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Icon,
     group_box::GroupBoxVariant,
@@ -10,6 +10,7 @@ use gpui_component::{
 use crate::assets::RuizIcon;
 use crate::settings::{AppSettings, save_config};
 use crate::state::AppState;
+use crate::ui::components::app_title_bar;
 
 pub struct SettingsView;
 
@@ -177,12 +178,16 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Settings::new("ruiz-settings")
-            .sidebar_width(px(216.))
-            .sidebar_size_range(px(184.)..px(300.))
-            .with_group_variant(GroupBoxVariant::Outline)
-            .pages([Self::ai_page(), Self::about_page()])
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().size_full().child(app_title_bar("设置", cx)).child(
+            div().flex_1().min_h_0().child(
+                Settings::new("ruiz-settings")
+                    .sidebar_width(px(216.))
+                    .sidebar_size_range(px(184.)..px(300.))
+                    .with_group_variant(GroupBoxVariant::Outline)
+                    .pages([Self::ai_page(), Self::about_page()]),
+            ),
+        )
     }
 }
 

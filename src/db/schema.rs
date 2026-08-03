@@ -112,5 +112,16 @@ mod tests {
         let reviews = db::reviews::by_card(&pool, card_id).await.unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].rating, Rating::Good);
+
+        // 删除笔记时同时清理卡片和复习记录。
+        db::notes::delete(&pool, note_id).await.unwrap();
+        assert!(db::notes::get(&pool, note_id).await.unwrap().is_none());
+        assert!(db::cards::get(&pool, card_id).await.unwrap().is_none());
+        assert!(
+            db::reviews::by_card(&pool, card_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
