@@ -3,3 +3,4 @@
 pub mod client;
 pub mod generate;
 pub mod judge;
+pub mod prompts;
