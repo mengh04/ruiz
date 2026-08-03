@@ -24,15 +24,13 @@ impl AppState {
         })
     }
 
-    /// 根据配置刷新 AI 客户端（三个字段齐全才启用）。
+    /// 根据本机 DeepSeek 配置刷新 AI 客户端。
     pub fn configure_ai(&mut self, config: &crate::settings::Config) {
         let c = &config.ai;
-        self.ai = match (&c.api_base, &c.api_key, &c.model) {
-            (Some(base), Some(key), Some(model)) => {
-                Some(ChatClient::new(base.clone(), key.clone(), model.clone()))
-            }
-            _ => None,
-        };
+        self.ai = c
+            .api_key
+            .as_ref()
+            .map(|key| ChatClient::new(key.clone(), c.model.clone()));
     }
 
     pub fn global(cx: &App) -> &AppState {

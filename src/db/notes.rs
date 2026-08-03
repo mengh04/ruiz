@@ -4,6 +4,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::domain::note::Note;
 
+#[allow(dead_code)] // 旧版手动建笔记 API 与数据库回归测试仍会使用
 pub async fn create(pool: &SqlitePool, title: &str, content: &str) -> Result<i64> {
     let now = Utc::now().to_rfc3339();
     let row = sqlx::query(
@@ -55,7 +56,26 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
         .bind(id)
         .execute(&mut *transaction)
         .await?;
+    sqlx::query(
+        "DELETE FROM card_knowledge_units
+         WHERE card_id IN (SELECT id FROM cards WHERE note_id = ?1)",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query("DELETE FROM cards WHERE note_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM knowledge_units WHERE note_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM knowledge_claims WHERE note_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM material_analyses WHERE note_id = ?1")
         .bind(id)
         .execute(&mut *transaction)
         .await?;

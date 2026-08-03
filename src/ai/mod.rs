@@ -2,5 +2,10 @@
 
 pub mod client;
 pub mod generate;
+pub mod import;
 pub mod judge;
+pub mod plan;
+pub mod progress;
 pub mod prompts;
+pub(crate) mod text;
+pub mod workflow;

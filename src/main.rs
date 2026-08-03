@@ -2,6 +2,7 @@ mod ai;
 mod app;
 mod assets;
 mod db;
+mod diagnostics;
 mod domain;
 mod scheduler;
 mod settings;

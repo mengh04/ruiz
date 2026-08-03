@@ -124,7 +124,7 @@ impl ReviewView {
             return;
         };
         let Some(ai) = AppState::global(cx).ai.clone() else {
-            self.error = Some("请先在「设置」里配置 AI（api_base / api_key / model）".into());
+            self.error = Some("请先在「设置」里配置 DeepSeek API 密钥".into());
             cx.notify();
             return;
         };
@@ -137,7 +137,11 @@ impl ReviewView {
         self.phase = Phase::Judging;
         self.error = None;
         cx.notify();
-        let (question, standard_answer) = (card.question.clone(), card.standard_answer.clone());
+        let (question, standard_answer, required_points) = (
+            card.question.clone(),
+            card.standard_answer.clone(),
+            card.required_points.clone(),
+        );
         self.submitted_answer = user_answer.clone();
         let submitted = user_answer;
         cx.spawn(
@@ -146,7 +150,14 @@ impl ReviewView {
                 let mut cx = (*cx).clone();
                 async move {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
-                        crate::ai::judge::judge(&ai, &question, &standard_answer, &submitted).await
+                        crate::ai::judge::judge(
+                            &ai,
+                            &question,
+                            &standard_answer,
+                            &required_points,
+                            &submitted,
+                        )
+                        .await
                     })
                     .await;
                     match result {
@@ -170,9 +181,17 @@ impl ReviewView {
                             .ok();
                         }
                         Err(e) => {
+                            crate::diagnostics::error(
+                                "review.judge.failed",
+                                "AI judgement failed",
+                                serde_json::json!({ "error": format!("{e:#}") }),
+                            );
                             this.update(&mut cx, |this, cx| {
                                 this.phase = Phase::Answering;
-                                this.error = Some(format!("判官调用失败: {e}"));
+                                this.error = Some(format!(
+                                    "判官调用失败: {e}\n{}",
+                                    crate::diagnostics::log_hint()
+                                ));
                                 cx.notify();
                             })
                             .ok();
@@ -267,6 +286,9 @@ impl ReviewView {
 impl Render for ReviewView {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
+        let success_color = cx.theme().green;
+        let warning_color = cx.theme().yellow;
+        let error_color = cx.theme().red;
         let compact = window.viewport_size().width.as_f32() < 900.;
 
         let error = self.error.clone().map(|e| {
@@ -514,6 +536,65 @@ impl Render for ReviewView {
                                             .child(SharedString::from(judgement.feedback.clone())),
                                     ),
                             )
+                            .when(!judgement.point_results.is_empty(), |this| {
+                                this.child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_sm().font_medium().child("必答点检查"))
+                                        .children(judgement.point_results.iter().map(|result| {
+                                            let point = card
+                                                .required_points
+                                                .get(result.point_index)
+                                                .cloned()
+                                                .unwrap_or_else(|| "未知必答点".into());
+                                            let (label, color) = match result.status.as_str() {
+                                                "correct" => ("已掌握", success_color),
+                                                "partial" => ("部分掌握", warning_color),
+                                                "missing" => ("未回答", warning_color),
+                                                _ => ("有误", error_color),
+                                            };
+                                            h_flex()
+                                                .items_start()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .mt_1()
+                                                        .size_2()
+                                                        .flex_shrink_0()
+                                                        .rounded_full()
+                                                        .bg(color),
+                                                )
+                                                .child(
+                                                    v_flex()
+                                                        .min_w_0()
+                                                        .gap_0p5()
+                                                        .child(
+                                                            h_flex()
+                                                                .gap_2()
+                                                                .flex_wrap()
+                                                                .child(div().text_sm().child(
+                                                                    SharedString::from(point),
+                                                                ))
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .font_medium()
+                                                                        .text_color(color)
+                                                                        .child(label),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(colors.muted_foreground)
+                                                                .child(SharedString::from(
+                                                                    result.feedback.clone(),
+                                                                )),
+                                                        ),
+                                                )
+                                        })),
+                                )
+                            })
                             .child(
                                 h_flex()
                                     .gap_2()

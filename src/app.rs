@@ -39,6 +39,9 @@ pub fn run() {
         AppSettings::init(cx);
 
         let data_dir = data_dir();
+        if let Err(error) = crate::diagnostics::init(&data_dir) {
+            eprintln!("初始化诊断日志失败: {error:#}");
+        }
         let db_path = format!("sqlite://{}?mode=rwc", data_dir.join("ruiz.db").display());
 
         let bounds = WindowBounds::centered(size(px(1280.), px(800.)), cx);
@@ -53,6 +56,11 @@ pub fn run() {
                     cx.update(|cx| cx.set_global(state));
                 }
                 Err(e) => {
+                    crate::diagnostics::error(
+                        "database.init.failed",
+                        "Database initialization failed",
+                        serde_json::json!({ "error": format!("{e:#}") }),
+                    );
                     eprintln!("初始化数据库失败: {e:?}");
                     return;
                 }

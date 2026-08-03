@@ -76,6 +76,11 @@ impl MainView {
                 },
             );
             if let Err(error) = result {
+                crate::diagnostics::error(
+                    "settings.window.open_failed",
+                    "Failed to open settings window",
+                    serde_json::json!({ "error": error.to_string() }),
+                );
                 eprintln!("打开设置窗口失败: {error}");
             }
         })

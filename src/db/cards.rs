@@ -5,6 +5,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::domain::card::Card;
 
+#[allow(dead_code)] // 旧版手动建卡 API 与数据库回归测试仍会使用
 pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
     let now = Utc::now().to_rfc3339();
     let row = sqlx::query(
@@ -26,29 +27,50 @@ pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
 }
 
 pub async fn by_note(pool: &SqlitePool, note_id: i64) -> Result<Vec<Card>> {
-    let rows = sqlx::query("SELECT * FROM cards WHERE note_id = ?1 ORDER BY created_at")
-        .bind(note_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT cards.*, card_knowledge_units.knowledge_unit_id,
+                knowledge_units.required_points_json
+         FROM cards
+         LEFT JOIN card_knowledge_units ON card_knowledge_units.card_id = cards.id
+         LEFT JOIN knowledge_units ON knowledge_units.id = card_knowledge_units.knowledge_unit_id
+         WHERE cards.note_id = ?1 ORDER BY cards.created_at",
+    )
+    .bind(note_id)
+    .fetch_all(pool)
+    .await?;
     rows.iter().map(from_row).collect::<Result<Vec<_>>>()
 }
 
 // 预留 CRUD API：后续功能（详情页/删除）会用到
 #[allow(dead_code)]
 pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Card>> {
-    let row = sqlx::query("SELECT * FROM cards WHERE id = ?1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query(
+        "SELECT cards.*, card_knowledge_units.knowledge_unit_id,
+                knowledge_units.required_points_json
+         FROM cards
+         LEFT JOIN card_knowledge_units ON card_knowledge_units.card_id = cards.id
+         LEFT JOIN knowledge_units ON knowledge_units.id = card_knowledge_units.knowledge_unit_id
+         WHERE cards.id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     row.map(|r| from_row(&r)).transpose()
 }
 
 /// 到期（due <= now）的卡片，按到期时间升序 —— 复习队列。
 pub async fn due(pool: &SqlitePool, now: DateTime<Utc>) -> Result<Vec<Card>> {
-    let rows = sqlx::query("SELECT * FROM cards WHERE due <= ?1 ORDER BY due ASC")
-        .bind(now.to_rfc3339())
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT cards.*, card_knowledge_units.knowledge_unit_id,
+                knowledge_units.required_points_json
+         FROM cards
+         LEFT JOIN card_knowledge_units ON card_knowledge_units.card_id = cards.id
+         LEFT JOIN knowledge_units ON knowledge_units.id = card_knowledge_units.knowledge_unit_id
+         WHERE cards.due <= ?1 ORDER BY cards.due ASC",
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
     rows.iter().map(from_row).collect::<Result<Vec<_>>>()
 }
 
@@ -64,7 +86,8 @@ pub async fn update_schedule(
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE cards
-         SET stability = ?1, difficulty = ?2, due = ?3, reps = ?4, lapses = ?5, updated_at = ?6
+         SET stability = ?1, difficulty = ?2, due = ?3, reps = ?4, lapses = ?5,
+             last_review = ?6, updated_at = ?6
          WHERE id = ?7",
     )
     .bind(memory.stability)
@@ -81,10 +104,16 @@ pub async fn update_schedule(
 
 #[allow(dead_code)]
 pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("DELETE FROM card_knowledge_units WHERE card_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
     sqlx::query("DELETE FROM cards WHERE id = ?1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -104,6 +133,14 @@ fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Card> {
         question: row.get("question"),
         standard_answer: row.get("standard_answer"),
         source_excerpt: row.get("source_excerpt"),
+        knowledge_unit_id: row
+            .try_get::<Option<i64>, _>("knowledge_unit_id")
+            .unwrap_or(None),
+        required_points: row
+            .try_get::<String, _>("required_points_json")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
         memory,
         due: row.get::<DateTime<Utc>, _>("due"),
         reps: row.get::<i64, _>("reps") as u32,

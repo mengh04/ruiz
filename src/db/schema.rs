@@ -30,6 +30,60 @@ CREATE TABLE IF NOT EXISTS cards (
 CREATE INDEX IF NOT EXISTS idx_cards_note ON cards(note_id);
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(due);
 
+CREATE TABLE IF NOT EXISTS material_analyses (
+    note_id              INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+    source_content       TEXT NOT NULL,
+    summary              TEXT NOT NULL,
+    document_type        TEXT NOT NULL,
+    warnings_json        TEXT NOT NULL DEFAULT '[]',
+    quick_count          INTEGER NOT NULL,
+    recommended_count    INTEGER NOT NULL,
+    comprehensive_count  INTEGER NOT NULL,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_claims (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id        INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    local_id       TEXT NOT NULL,
+    statement      TEXT NOT NULL,
+    importance     TEXT NOT NULL,
+    evidence_json  TEXT NOT NULL,
+    position       INTEGER NOT NULL,
+    UNIQUE(note_id, local_id)
+);
+CREATE INDEX IF NOT EXISTS idx_claims_note ON knowledge_claims(note_id, position);
+
+CREATE TABLE IF NOT EXISTS knowledge_units (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id                INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    local_id               TEXT NOT NULL,
+    topic                  TEXT NOT NULL,
+    objective              TEXT NOT NULL,
+    unit_type              TEXT NOT NULL,
+    importance             TEXT NOT NULL,
+    stage                  TEXT NOT NULL,
+    cognitive_action       TEXT NOT NULL,
+    required_points_json   TEXT NOT NULL,
+    claim_ids_json         TEXT NOT NULL,
+    evidence_json          TEXT NOT NULL,
+    reason                 TEXT NOT NULL,
+    quick                  INTEGER NOT NULL DEFAULT 0,
+    recommended            INTEGER NOT NULL DEFAULT 0,
+    generated              INTEGER NOT NULL DEFAULT 0,
+    prerequisite_ids_json  TEXT NOT NULL DEFAULT '[]',
+    position               INTEGER NOT NULL,
+    UNIQUE(note_id, local_id)
+);
+CREATE INDEX IF NOT EXISTS idx_units_note ON knowledge_units(note_id, position);
+
+CREATE TABLE IF NOT EXISTS card_knowledge_units (
+    card_id            INTEGER PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE,
+    knowledge_unit_id  INTEGER NOT NULL REFERENCES knowledge_units(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_card_units_unit ON card_knowledge_units(knowledge_unit_id);
+
 CREATE TABLE IF NOT EXISTS reviews (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id     INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
@@ -51,6 +105,12 @@ pub async fn init(db_path: &str) -> Result<SqlitePool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{
+        generate::Question,
+        import::ImportedMaterial,
+        plan::{MaterialPlan, PlanClaim, PlanUnit},
+        workflow::PreparedMaterial,
+    };
     use crate::domain::{card::Card, review::Rating};
     use crate::{db, scheduler::Scheduler};
 
@@ -85,6 +145,7 @@ mod tests {
         let cards = db::cards::by_note(&pool, note_id).await.unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].question, "PPP 帧格式？");
+        assert!(cards[0].knowledge_unit_id.is_none());
         // 新卡 due 是当前时间，应进入复习队列
         let due = db::cards::due(&pool, chrono::Utc::now()).await.unwrap();
         assert_eq!(due.len(), 1);
@@ -112,6 +173,65 @@ mod tests {
         let reviews = db::reviews::by_card(&pool, card_id).await.unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].rating, Rating::Good);
+
+        // 新版智能导入：知识蓝图、卡片映射与结构化必答点。
+        let prepared = PreparedMaterial {
+            material: ImportedMaterial {
+                title: "计算机网络 第三章".into(),
+                content: "数据链路层内容…".into(),
+                raw_content: "原始内容".into(),
+                summary: "摘要".into(),
+                document_type: "concept".into(),
+            },
+            plan: MaterialPlan {
+                summary: "摘要".into(),
+                document_type: "concept".into(),
+                warnings: vec![],
+                claims: vec![PlanClaim {
+                    id: "C1".into(),
+                    statement: "PPP 使用特定帧格式".into(),
+                    importance: "core".into(),
+                    evidence: vec!["PPP 帧".into()],
+                }],
+                units: vec![PlanUnit {
+                    id: "K1".into(),
+                    topic: "PPP".into(),
+                    objective: "能够说明 PPP 帧格式".into(),
+                    unit_type: "concept".into(),
+                    importance: "core".into(),
+                    stage: "foundation".into(),
+                    cognitive_action: "recall".into(),
+                    required_points: vec!["标志字段为 0x7E".into()],
+                    claim_ids: vec!["C1".into()],
+                    evidence: vec!["标志字段 0x7E".into()],
+                    reason: "核心格式".into(),
+                    quick: true,
+                    recommended: true,
+                    prerequisite_unit_ids: vec![],
+                }],
+            },
+            questions: vec![Question {
+                unit_id: "K1".into(),
+                question: "PPP 帧的标志字段是什么？".into(),
+                standard_answer: "标志字段为 0x7E。".into(),
+                source_excerpt: Some("标志字段 0x7E".into()),
+                required_points: vec!["标志字段为 0x7E".into()],
+            }],
+        };
+        db::knowledge::save_plan_for_note(&pool, note_id, &prepared)
+            .await
+            .unwrap();
+        let analysis = db::knowledge::analysis_by_note(&pool, note_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(analysis.recommended_count, 1);
+        let mapped_cards = db::cards::by_note(&pool, note_id).await.unwrap();
+        let mapped = mapped_cards
+            .iter()
+            .find(|card| card.knowledge_unit_id.is_some())
+            .unwrap();
+        assert_eq!(mapped.required_points, vec!["标志字段为 0x7E"]);
 
         // 删除笔记时同时清理卡片和复习记录。
         db::notes::delete(&pool, note_id).await.unwrap();

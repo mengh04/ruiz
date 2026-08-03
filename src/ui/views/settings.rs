@@ -7,6 +7,7 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::ai::client::{DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL};
 use crate::assets::RuizIcon;
 use crate::settings::{AppSettings, save_config};
 use crate::state::AppState;
@@ -22,40 +23,14 @@ impl SettingsView {
     fn ai_page() -> SettingPage {
         SettingPage::new("AI 助手")
             .icon(Icon::new(RuizIcon::Sparkles))
-            .description("连接兼容 OpenAI API 的服务，为笔记生成内容并辅助复习判断。")
+            .description("连接 DeepSeek API，为材料整理、知识提取、出题和复习判断提供支持。")
             .default_open(true)
             .resettable(false)
             .groups([
                 SettingGroup::new()
-                    .title("服务连接")
-                    .description("配置 API 服务地址和访问凭据。修改后会自动保存。")
-                    .items([
-                        SettingItem::new(
-                            "API 地址",
-                            SettingField::input(
-                                |cx| {
-                                    AppSettings::global(cx)
-                                        .settings
-                                        .ai
-                                        .api_base
-                                        .clone()
-                                        .unwrap_or_default()
-                                        .into()
-                                },
-                                |value, cx| {
-                                    AppSettings::global_mut(cx).settings.ai.api_base =
-                                        optional_value(value.as_ref());
-                                    refresh_ai(cx);
-                                },
-                            ),
-                        )
-                        .description("例如 https://api.openai.com/v1，也可以填写兼容服务的地址。")
-                        .keywords([
-                            "api_base",
-                            "base url",
-                            "endpoint",
-                            "接口地址",
-                        ]),
+                    .title("DeepSeek 连接")
+                    .description("使用官方接口 https://api.deepseek.com，修改后会自动保存。")
+                    .item(
                         SettingItem::new(
                             "API 密钥",
                             SettingField::input(
@@ -77,32 +52,29 @@ impl SettingsView {
                         )
                         .description("用于认证 API 请求，配置仅保存在本机。")
                         .keywords(["api_key", "token", "密钥", "令牌"]),
-                    ]),
+                    ),
                 SettingGroup::new()
                     .title("模型")
                     .description("选择生成笔记和判断复习结果时使用的模型。")
                     .item(
                         SettingItem::new(
-                            "模型名称",
-                            SettingField::input(
-                                |cx| {
-                                    AppSettings::global(cx)
-                                        .settings
-                                        .ai
-                                        .model
-                                        .clone()
-                                        .unwrap_or_default()
-                                        .into()
-                                },
+                            "DeepSeek 模型",
+                            SettingField::dropdown(
+                                vec![
+                                    (DEEPSEEK_FLASH_MODEL.into(), "V4 Flash".into()),
+                                    (DEEPSEEK_PRO_MODEL.into(), "V4 Pro".into()),
+                                ],
+                                |cx| AppSettings::global(cx).settings.ai.model.clone().into(),
                                 |value, cx| {
                                     AppSettings::global_mut(cx).settings.ai.model =
-                                        optional_value(value.as_ref());
+                                        value.to_string();
                                     refresh_ai(cx);
                                 },
-                            ),
+                            )
+                            .default_value(DEEPSEEK_FLASH_MODEL),
                         )
-                        .description("填写服务支持的模型标识，例如 gpt-4.1-mini。")
-                        .keywords(["model", "模型", "gpt"]),
+                        .description("Flash 成本更低、速度更快；Pro 适合更复杂的材料分析。")
+                        .keywords(["model", "模型", "deepseek", "flash", "pro"]),
                     ),
                 SettingGroup::new().title("说明").item(SettingItem::render(
                     |_options, _window, cx| {
@@ -120,9 +92,8 @@ impl SettingsView {
                                     .gap_1()
                                     .text_sm()
                                     .child("设置会在输入时自动保存，无需额外点击按钮。")
-                                    .child(
-                                        "留空的字段将使用应用默认值；修改会立即作用于后续请求。",
-                                    ),
+                                    .child("所有 DeepSeek 请求统一使用高强度思考模式，并按工作阶段分配输出预算。")
+                                    .child("DeepSeek V4 支持 1M 上下文；Ruiz 会按工作阶段控制单次输出预算。"),
                             )
                     },
                 )),
@@ -200,6 +171,11 @@ fn optional_value(value: &str) -> Option<String> {
 fn refresh_ai(cx: &mut gpui::App) {
     let config = AppSettings::global(cx).settings.clone();
     if let Err(error) = save_config(&config) {
+        crate::diagnostics::error(
+            "settings.save_failed",
+            "Failed to save settings",
+            serde_json::json!({ "error": format!("{error:#}") }),
+        );
         eprintln!("保存设置失败: {error}");
     }
     AppState::global_mut(cx).configure_ai(&config);

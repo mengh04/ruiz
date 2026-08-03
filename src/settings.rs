@@ -1,24 +1,49 @@
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
+use crate::ai::client::{DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL};
+
 #[derive(Debug, Default, Serialize, Clone, Deserialize)]
 pub struct Config {
     pub ai: AiConfig,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiConfig {
-    pub api_base: Option<String>,
     pub api_key: Option<String>,
-    pub model: Option<String>,
+    pub model: String,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: DEEPSEEK_FLASH_MODEL.into(),
+        }
+    }
+}
+
+impl AiConfig {
+    fn normalize(&mut self) {
+        self.api_key = self
+            .api_key
+            .take()
+            .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+        if self.model != DEEPSEEK_FLASH_MODEL && self.model != DEEPSEEK_PRO_MODEL {
+            self.model = DEEPSEEK_FLASH_MODEL.into();
+        }
+    }
 }
 
 pub fn load_config() -> Config {
     let path = config_path();
-    match std::fs::read_to_string(path) {
+    let mut config = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => Config::default(),
-    }
+    };
+    config.ai.normalize();
+    config
 }
 
 pub fn save_config(config: &Config) -> std::io::Result<()> {
@@ -56,5 +81,26 @@ impl AppSettings {
 
     pub fn global_mut(cx: &mut App) -> &mut Self {
         cx.global_mut::<AppSettings>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, DEEPSEEK_FLASH_MODEL};
+
+    #[test]
+    fn old_openai_compatible_config_migrates_to_deepseek() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "ai": {
+                "api_base": "https://example.invalid/v1",
+                "api_key": " secret ",
+                "model": "gpt-example"
+            }
+        }))
+        .unwrap();
+        config.ai.normalize();
+        assert_eq!(config.ai.api_key.as_deref(), Some("secret"));
+        assert_eq!(config.ai.model, DEEPSEEK_FLASH_MODEL);
+        assert!(serde_json::to_value(config).unwrap()["ai"]["api_base"].is_null());
     }
 }
