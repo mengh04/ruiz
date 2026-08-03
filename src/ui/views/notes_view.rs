@@ -7,7 +7,7 @@ use gpui::{
 use gpui_component::Disableable as _;
 use gpui_component::alert::Alert;
 use gpui_component::breadcrumb::{Breadcrumb, BreadcrumbItem};
-use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonGroup, ButtonVariant, ButtonVariants as _};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_component::input::{Input, InputState};
@@ -16,7 +16,8 @@ use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
 use gpui_component::theme::ActiveTheme as _;
 use gpui_component::{
-    Icon, IconName, Placement, Root, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    Icon, IconName, Placement, Root, Selectable as _, Sizable as _, StyledExt as _, WindowExt as _,
+    h_flex, v_flex,
 };
 
 use crate::ai::progress::{ImportProgress, ImportStage};
@@ -41,6 +42,7 @@ pub struct NotesView {
     importing: bool,
     import_progress: Option<ImportProgress>,
     generating: bool,
+    generation_scope: GenerationScope,
     deleting_note_id: Option<i64>,
     message: Option<Message>,
     /// 窗口句柄（清空输入框等窗口操作需要）
@@ -57,6 +59,41 @@ enum NotesPage {
     #[default]
     Library,
     Detail(i64),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GenerationScope {
+    Quick,
+    #[default]
+    Recommended,
+    Comprehensive,
+}
+
+impl GenerationScope {
+    fn includes(self, quick: bool, recommended: bool) -> bool {
+        match self {
+            Self::Quick => quick,
+            Self::Recommended => recommended,
+            Self::Comprehensive => true,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Quick => "精简",
+            Self::Recommended => "AI 建议",
+            Self::Comprehensive => "全面",
+        }
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Quick),
+            1 => Some(Self::Recommended),
+            2 => Some(Self::Comprehensive),
+            _ => None,
+        }
+    }
 }
 
 impl NotesPage {
@@ -96,6 +133,7 @@ impl NotesView {
             importing: false,
             import_progress: None,
             generating: false,
+            generation_scope: GenerationScope::default(),
             deleting_note_id: None,
             message: None,
             window: window_handle,
@@ -534,7 +572,7 @@ impl NotesView {
         .detach();
     }
 
-    /// 为旧笔记补建蓝图，或为新版材料生成尚未生成的全面单元。
+    /// 为旧笔记补建蓝图，或按当前范围生成尚未生成的知识单元。
     fn generate(&mut self, cx: &mut Context<Self>) {
         let Some(note_id) = self.page.note_id() else {
             self.message = Some(Message::Error("请先选中一篇笔记".into()));
@@ -552,14 +590,20 @@ impl NotesView {
             return;
         };
         let has_analysis = self.analysis.is_some();
+        let generation_scope = self.generation_scope;
         let remaining_units = self
             .units
             .iter()
-            .filter(|unit| !unit.generated)
+            .filter(|unit| {
+                !unit.generated && generation_scope.includes(unit.quick, unit.recommended)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if has_analysis && remaining_units.is_empty() {
-            self.message = Some(Message::Success("所有知识单元都已经生成卡片".into()));
+            self.message = Some(Message::Success(format!(
+                "{}范围的卡片已经全部生成",
+                generation_scope.label()
+            )));
             cx.notify();
             return;
         }
@@ -592,7 +636,9 @@ impl NotesView {
                             let selected = plan
                                 .units
                                 .iter()
-                                .filter(|unit| unit.recommended)
+                                .filter(|unit| {
+                                    generation_scope.includes(unit.quick, unit.recommended)
+                                })
                                 .cloned()
                                 .collect::<Vec<_>>();
                             let questions =
@@ -883,15 +929,16 @@ impl Render for NotesView {
                                     let title = note.title.clone();
                                     let created_at = note.created_at.format("%Y-%m-%d").to_string();
                                     let excerpt =
-                                        preview(&note.content, if compact { 80 } else { 150 });
+                                        preview(&note.content, if compact { 72 } else { 120 });
                                     div()
                                         .id(SharedString::from(format!("library-note-{id}")))
                                         .w_full()
                                         .max_w(px(992.))
                                         .mx_auto()
-                                        .mb_3()
-                                        .p_4()
-                                        .rounded_xl()
+                                        .mb_2()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_lg()
                                         .border_1()
                                         .border_color(colors.border)
                                         .bg(colors.background)
@@ -907,10 +954,10 @@ impl Render for NotesView {
                                         .child(
                                             h_flex()
                                                 .items_center()
-                                                .gap_4()
+                                                .gap_3()
                                                 .child(
                                                     h_flex()
-                                                        .size_10()
+                                                        .size_8()
                                                         .flex_shrink_0()
                                                         .items_center()
                                                         .justify_center()
@@ -919,7 +966,7 @@ impl Render for NotesView {
                                                         .text_color(colors.primary)
                                                         .child(
                                                             Icon::new(RuizIcon::NotebookText)
-                                                                .size_5(),
+                                                                .size_4(),
                                                         ),
                                                 )
                                                 .child(
@@ -928,23 +975,37 @@ impl Render for NotesView {
                                                         .flex_1()
                                                         .gap_0p5()
                                                         .child(
-                                                            div()
-                                                                .overflow_hidden()
-                                                                .text_ellipsis()
-                                                                .font_semibold()
-                                                                .child(SharedString::from(title)),
+                                                            h_flex()
+                                                                .min_w_0()
+                                                                .w_full()
+                                                                .justify_between()
+                                                                .gap_3()
+                                                                .child(
+                                                                    div()
+                                                                        .min_w_0()
+                                                                        .flex_1()
+                                                                        .truncate()
+                                                                        .font_semibold()
+                                                                        .child(SharedString::from(
+                                                                            title,
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex_shrink_0()
+                                                                        .text_xs()
+                                                                        .text_color(
+                                                                            colors.muted_foreground,
+                                                                        )
+                                                                        .child(created_at),
+                                                                ),
                                                         )
                                                         .child(
                                                             div()
-                                                                .text_sm()
-                                                                .text_color(colors.muted_foreground)
-                                                                .child(excerpt),
-                                                        )
-                                                        .child(
-                                                            div()
+                                                                .line_clamp(1)
                                                                 .text_xs()
                                                                 .text_color(colors.muted_foreground)
-                                                                .child(created_at),
+                                                                .child(excerpt),
                                                         ),
                                                 )
                                                 .child(
@@ -960,182 +1021,386 @@ impl Render for NotesView {
             .vertical_scrollbar(&self.notes_scroll);
 
         // 二级页面：只展示当前笔记详情。
-        let detail =
-            if let Some(id) = self.page.note_id() {
-                let note = self.notes.iter().find(|n| n.id == id);
-                let cards = &self.cards;
-                let breadcrumb_view = cx.entity();
-                let breadcrumb = Breadcrumb::new()
-                    .child(BreadcrumbItem::new("资料库").on_click(move |_, _, cx| {
-                        breadcrumb_view.update(cx, |this, cx| this.show_library(cx));
-                    }))
-                    .child(BreadcrumbItem::new(
-                        note.map(|note| note.title.clone())
-                            .unwrap_or_else(|| "笔记详情".into()),
-                    ));
-                let remaining_count = self.units.iter().filter(|unit| !unit.generated).count();
-                let generate_label = if self.analysis.is_some() {
-                    if self.generating {
-                        "生成中…".to_string()
-                    } else {
-                        format!("生成剩余 {remaining_count} 张")
-                    }
-                } else if self.generating {
-                    "分析中…".to_string()
+        let detail = if let Some(id) = self.page.note_id() {
+            let note = self.notes.iter().find(|n| n.id == id);
+            let cards = &self.cards;
+            let breadcrumb_view = cx.entity();
+            let breadcrumb = Breadcrumb::new()
+                .child(BreadcrumbItem::new("资料库").on_click(move |_, _, cx| {
+                    breadcrumb_view.update(cx, |this, cx| this.show_library(cx));
+                }))
+                .child(BreadcrumbItem::new(
+                    note.map(|note| note.title.clone())
+                        .unwrap_or_else(|| "笔记详情".into()),
+                ));
+            let remaining_count = self
+                .units
+                .iter()
+                .filter(|unit| {
+                    !unit.generated && self.generation_scope.includes(unit.quick, unit.recommended)
+                })
+                .count();
+            let quick_label = self.analysis.as_ref().map_or_else(
+                || "精简".to_string(),
+                |analysis| format!("精简 · {}", analysis.quick_count),
+            );
+            let recommended_label = self.analysis.as_ref().map_or_else(
+                || "AI 建议".to_string(),
+                |analysis| format!("AI 建议 · {}", analysis.recommended_count),
+            );
+            let comprehensive_label = self.analysis.as_ref().map_or_else(
+                || "全面".to_string(),
+                |analysis| format!("全面 · {}", analysis.comprehensive_count),
+            );
+            let generate_label = if self.analysis.is_some() {
+                if self.generating {
+                    "生成中…".to_string()
+                } else if remaining_count == 0 {
+                    format!("{}已生成", self.generation_scope.label())
                 } else {
-                    "建立知识蓝图".to_string()
-                };
-                let generate_bar = GroupBox::new()
-                    .outline()
+                    format!("生成{} {remaining_count} 张", self.generation_scope.label())
+                }
+            } else if self.generating {
+                "分析中…".to_string()
+            } else {
+                format!("建立蓝图并生成{}", self.generation_scope.label())
+            };
+            let generate_bar = GroupBox::new()
+                .outline()
+                .title(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(RuizIcon::Sparkles).size_4())
+                        .child("AI 学习蓝图"),
+                )
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .flex_wrap()
+                                .child(div().text_sm().font_medium().child("生成范围"))
+                                .child(
+                                    ButtonGroup::new("generation-scope")
+                                        .small()
+                                        .outline()
+                                        .disabled(self.generating || self.cards_loading)
+                                        .children([
+                                            Button::new("scope-quick").label(quick_label).selected(
+                                                self.generation_scope == GenerationScope::Quick,
+                                            ),
+                                            Button::new("scope-recommended")
+                                                .label(recommended_label)
+                                                .selected(
+                                                    self.generation_scope
+                                                        == GenerationScope::Recommended,
+                                                ),
+                                            Button::new("scope-comprehensive")
+                                                .label(comprehensive_label)
+                                                .selected(
+                                                    self.generation_scope
+                                                        == GenerationScope::Comprehensive,
+                                                ),
+                                        ])
+                                        .on_click(cx.listener(
+                                            |this, selected: &Vec<usize>, _, cx| {
+                                                if let Some(scope) =
+                                                    selected.first().and_then(|index| {
+                                                        GenerationScope::from_index(*index)
+                                                    })
+                                                {
+                                                    this.generation_scope = scope;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        )),
+                                ),
+                        )
+                        .when(self.analysis.is_none(), |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(colors.muted_foreground)
+                                    .child("导入旧笔记后，可以建立知识蓝图并生成学习卡片。"),
+                            )
+                        })
+                        .when_some(self.analysis.as_ref(), |this, analysis| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(colors.muted_foreground)
+                                    .child(SharedString::from(analysis.summary.clone())),
+                            )
+                        })
+                        .when(
+                            self.analysis
+                                .as_ref()
+                                .is_some_and(|analysis| !analysis.warnings.is_empty()),
+                            |this| {
+                                let warnings = self
+                                    .analysis
+                                    .as_ref()
+                                    .map(|analysis| analysis.warnings.join("\n"))
+                                    .unwrap_or_default();
+                                this.child(Alert::warning("analysis-warning", warnings))
+                            },
+                        )
+                        .child(
+                            Button::new("btn-generate")
+                                .icon(RuizIcon::Sparkles)
+                                .label(generate_label)
+                                .primary()
+                                .loading(self.generating)
+                                .disabled(
+                                    self.generating
+                                        || self.cards_loading
+                                        || (self.analysis.is_some() && remaining_count == 0),
+                                )
+                                .when(compact, |this| this.w_full())
+                                .on_click(cx.listener(|this, _, _, cx| this.generate(cx))),
+                        ),
+                );
+
+            let card_list = if self.cards_loading {
+                v_flex()
+                    .w_full()
+                    .gap_3()
+                    .child(Skeleton::new().w_full())
+                    .child(Skeleton::new().secondary().w_4_5())
+                    .child(Skeleton::new().secondary().w_full())
+                    .into_any_element()
+            } else if cards.is_empty() {
+                empty_state(
+                    IconName::Inbox,
+                    "还没有学习卡片",
+                    "用 AI 从这篇笔记生成一组问题，之后就可以在复习页练习。",
+                    None,
+                    cx,
+                )
+                .into_any_element()
+            } else {
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .children(cards.iter().enumerate().map(|(index, card)| {
+                        div()
+                            .w_full()
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.background)
+                            .hover(|style| style.border_color(colors.primary))
+                            .child(
+                                h_flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .child(
+                                        h_flex()
+                                            .size_6()
+                                            .flex_shrink_0()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .bg(colors.muted)
+                                            .text_xs()
+                                            .text_color(colors.muted_foreground)
+                                            .child((index + 1).to_string()),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .gap_1()
+                                            .child(SharedString::from(card.question.clone()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(colors.muted_foreground)
+                                                    .child(format!(
+                                                        "复习 {} 次 · 遗忘 {} 次",
+                                                        card.reps, card.lapses
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                    }))
+                    .into_any_element()
+            };
+
+            let blueprint = if self.units.is_empty() {
+                div().into_any_element()
+            } else {
+                GroupBox::new()
+                    .fill()
                     .title(
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(Icon::new(RuizIcon::Sparkles).size_4())
-                            .child("AI 学习蓝图"),
+                            .child(Icon::new(IconName::File).size_4())
+                            .child(format!("知识蓝图 · {} 个学习目标", self.units.len())),
                     )
-                    .child(
-                        v_flex()
+                    .child(v_flex().gap_2().children(self.units.iter().map(|unit| {
+                        let (importance_label, importance_color) =
+                            importance_style(&unit.importance, cx);
+                        h_flex()
+                            .items_start()
                             .gap_3()
-                            .child(if let Some(analysis) = &self.analysis {
-                                h_flex()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .children([
-                                        stat_badge(
-                                            "精简",
-                                            analysis.quick_count,
-                                            colors.muted,
-                                            colors.muted_foreground,
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.background)
+                            .child(div().mt_1().size_2().flex_shrink_0().rounded_full().bg(
+                                if unit.generated {
+                                    cx.theme().green
+                                } else {
+                                    colors.muted_foreground
+                                },
+                            ))
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .flex_wrap()
+                                            .child(
+                                                div().text_sm().font_medium().child(
+                                                    SharedString::from(unit.objective.clone()),
+                                                ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_full()
+                                                    .bg(importance_color.opacity(0.12))
+                                                    .text_xs()
+                                                    .text_color(importance_color)
+                                                    .child(importance_label),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_full()
+                                                    .bg(colors.muted)
+                                                    .text_xs()
+                                                    .text_color(colors.muted_foreground)
+                                                    .child(unit_type_label(&unit.unit_type)),
+                                            ),
+                                    )
+                                    .child(
+                                        div().text_xs().text_color(colors.muted_foreground).child(
+                                            format!(
+                                                "{} · {} 个必答点 · {}",
+                                                unit.topic,
+                                                unit.required_points.len(),
+                                                if unit.generated {
+                                                    "已生成卡片"
+                                                } else {
+                                                    "等待生成"
+                                                }
+                                            ),
                                         ),
-                                        stat_badge(
-                                            "AI 建议",
-                                            analysis.recommended_count,
-                                            colors.primary.opacity(0.12),
-                                            colors.primary,
-                                        ),
-                                        stat_badge(
-                                            "全面",
-                                            analysis.comprehensive_count,
-                                            colors.muted,
-                                            colors.muted_foreground,
-                                        ),
-                                    ])
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .text_sm()
-                                    .text_color(colors.muted_foreground)
-                                    .child("导入旧笔记后，可以建立知识蓝图并生成 AI 推荐卡片。")
-                                    .into_any_element()
-                            })
-                            .when_some(self.analysis.as_ref(), |this, analysis| {
-                                this.child(
+                                    ),
+                            )
+                    })))
+                    .into_any_element()
+            };
+
+            v_flex()
+                .flex_1()
+                .w_full()
+                .max_w(px(1040.))
+                .mx_auto()
+                .when(compact, |this| this.p_4())
+                .when(!compact, |this| this.p_6())
+                .gap_4()
+                .child(breadcrumb)
+                .child(
+                    h_flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_4()
+                        .flex_wrap()
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
                                     div()
+                                        .text_2xl()
+                                        .font_semibold()
+                                        .text_color(colors.foreground)
+                                        .child(SharedString::from(
+                                            note.map(|n| n.title.clone()).unwrap_or_default(),
+                                        )),
+                                )
+                                .child(
+                                    div().text_sm().text_color(colors.muted_foreground).child(
+                                        note.map(|n| {
+                                            format!(
+                                                "创建于 {} · {} 个字符",
+                                                n.created_at.format("%Y-%m-%d"),
+                                                n.content.chars().count()
+                                            )
+                                        })
+                                        .unwrap_or_default(),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_full()
+                                        .bg(colors.muted)
                                         .text_sm()
                                         .text_color(colors.muted_foreground)
-                                        .child(SharedString::from(analysis.summary.clone())),
+                                        .child(format!("{} 张卡片", cards.len())),
                                 )
-                            })
-                            .when(
-                                self.analysis
-                                    .as_ref()
-                                    .is_some_and(|analysis| !analysis.warnings.is_empty()),
-                                |this| {
-                                    let warnings = self
-                                        .analysis
-                                        .as_ref()
-                                        .map(|analysis| analysis.warnings.join("\n"))
-                                        .unwrap_or_default();
-                                    this.child(Alert::warning("analysis-warning", warnings))
-                                },
-                            )
-                            .child(
-                                Button::new("btn-generate")
-                                    .icon(RuizIcon::Sparkles)
-                                    .label(generate_label)
-                                    .primary()
-                                    .loading(self.generating)
-                                    .disabled(
-                                        self.generating
-                                            || self.cards_loading
-                                            || (self.analysis.is_some() && remaining_count == 0),
-                                    )
-                                    .when(compact, |this| this.w_full())
-                                    .on_click(cx.listener(|this, _, _, cx| this.generate(cx))),
-                            ),
-                    );
-
-                let card_list = if self.cards_loading {
-                    v_flex()
-                        .w_full()
-                        .gap_3()
-                        .child(Skeleton::new().w_full())
-                        .child(Skeleton::new().secondary().w_4_5())
-                        .child(Skeleton::new().secondary().w_full())
-                        .into_any_element()
-                } else if cards.is_empty() {
-                    empty_state(
-                        IconName::Inbox,
-                        "还没有学习卡片",
-                        "用 AI 从这篇笔记生成一组问题，之后就可以在复习页练习。",
-                        None,
-                        cx,
-                    )
-                    .into_any_element()
-                } else {
-                    v_flex()
-                        .w_full()
-                        .gap_2()
-                        .children(cards.iter().enumerate().map(|(index, card)| {
-                            div()
-                                .w_full()
-                                .p_3()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(colors.border)
-                                .bg(colors.background)
-                                .hover(|style| style.border_color(colors.primary))
                                 .child(
-                                    h_flex()
-                                        .items_start()
-                                        .gap_3()
-                                        .child(
-                                            h_flex()
-                                                .size_6()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(colors.muted)
-                                                .text_xs()
-                                                .text_color(colors.muted_foreground)
-                                                .child((index + 1).to_string()),
-                                        )
-                                        .child(
-                                            v_flex()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .gap_1()
-                                                .child(SharedString::from(card.question.clone()))
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(colors.muted_foreground)
-                                                        .child(format!(
-                                                            "复习 {} 次 · 遗忘 {} 次",
-                                                            card.reps, card.lapses
-                                                        )),
-                                                ),
-                                        ),
-                                )
-                        }))
-                        .into_any_element()
-                };
-
-                let blueprint = if self.units.is_empty() {
-                    div().into_any_element()
-                } else {
+                                    Button::new("delete-note")
+                                        .small()
+                                        .icon(IconName::Delete)
+                                        .label("删除")
+                                        .danger()
+                                        .outline()
+                                        .loading(self.deleting_note_id == Some(id))
+                                        .disabled(self.deleting_note_id.is_some())
+                                        .on_click({
+                                            let title = note
+                                                .map(|note| note.title.clone())
+                                                .unwrap_or_default();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.confirm_delete_note(
+                                                    id,
+                                                    title.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        ),
+                )
+                .child(generate_bar)
+                .child(blueprint)
+                .child(
                     GroupBox::new()
                         .fill()
                         .title(
@@ -1143,201 +1408,38 @@ impl Render for NotesView {
                                 .items_center()
                                 .gap_2()
                                 .child(Icon::new(IconName::File).size_4())
-                                .child(format!("知识蓝图 · {} 个学习目标", self.units.len())),
+                                .child("整理后正文"),
                         )
-                        .child(v_flex().gap_2().children(self.units.iter().map(|unit| {
-                            let (importance_label, importance_color) =
-                                importance_style(&unit.importance, cx);
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(colors.muted_foreground)
+                                .child(note.map(|n| preview(&n.content, 320)).unwrap_or_default()),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
                             h_flex()
-                                .items_start()
-                                .gap_3()
-                                .p_3()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(colors.border)
-                                .bg(colors.background)
-                                .child(div().mt_1().size_2().flex_shrink_0().rounded_full().bg(
-                                    if unit.generated {
-                                        cx.theme().green
-                                    } else {
-                                        colors.muted_foreground
-                                    },
-                                ))
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .gap_1()
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .flex_wrap()
-                                                .child(div().text_sm().font_medium().child(
-                                                    SharedString::from(unit.objective.clone()),
-                                                ))
-                                                .child(
-                                                    div()
-                                                        .px_1p5()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(importance_color.opacity(0.12))
-                                                        .text_xs()
-                                                        .text_color(importance_color)
-                                                        .child(importance_label),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .px_1p5()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(colors.muted)
-                                                        .text_xs()
-                                                        .text_color(colors.muted_foreground)
-                                                        .child(unit_type_label(&unit.unit_type)),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(colors.muted_foreground)
-                                                .child(format!(
-                                                    "{} · {} 个必答点 · {}",
-                                                    unit.topic,
-                                                    unit.required_points.len(),
-                                                    if unit.generated {
-                                                        "已生成卡片"
-                                                    } else {
-                                                        "等待生成"
-                                                    }
-                                                )),
-                                        ),
-                                )
-                        })))
-                        .into_any_element()
-                };
-
-                v_flex()
-                    .flex_1()
-                    .w_full()
-                    .max_w(px(1040.))
-                    .mx_auto()
-                    .when(compact, |this| this.p_4())
-                    .when(!compact, |this| this.p_6())
-                    .gap_4()
-                    .child(breadcrumb)
-                    .child(
-                        h_flex()
-                            .items_start()
-                            .justify_between()
-                            .gap_4()
-                            .flex_wrap()
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_2xl()
-                                            .font_semibold()
-                                            .text_color(colors.foreground)
-                                            .child(SharedString::from(
-                                                note.map(|n| n.title.clone()).unwrap_or_default(),
-                                            )),
-                                    )
-                                    .child(
-                                        div().text_sm().text_color(colors.muted_foreground).child(
-                                            note.map(|n| {
-                                                format!(
-                                                    "创建于 {} · {} 个字符",
-                                                    n.created_at.format("%Y-%m-%d"),
-                                                    n.content.chars().count()
-                                                )
-                                            })
-                                            .unwrap_or_default(),
-                                        ),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_full()
-                                            .bg(colors.muted)
-                                            .text_sm()
-                                            .text_color(colors.muted_foreground)
-                                            .child(format!("{} 张卡片", cards.len())),
-                                    )
-                                    .child(
-                                        Button::new("delete-note")
-                                            .small()
-                                            .icon(IconName::Delete)
-                                            .label("删除")
-                                            .danger()
-                                            .outline()
-                                            .loading(self.deleting_note_id == Some(id))
-                                            .disabled(self.deleting_note_id.is_some())
-                                            .on_click({
-                                                let title = note
-                                                    .map(|note| note.title.clone())
-                                                    .unwrap_or_default();
-                                                cx.listener(move |this, _, window, cx| {
-                                                    this.confirm_delete_note(
-                                                        id,
-                                                        title.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })
-                                            }),
-                                    ),
-                            ),
-                    )
-                    .child(generate_bar)
-                    .child(blueprint)
-                    .child(
-                        GroupBox::new()
-                            .fill()
-                            .title(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(Icon::new(IconName::File).size_4())
-                                    .child("整理后正文"),
-                            )
-                            .child(
-                                div().text_sm().text_color(colors.muted_foreground).child(
-                                    note.map(|n| preview(&n.content, 320)).unwrap_or_default(),
-                                ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(Icon::new(RuizIcon::NotebookText).size_4())
-                                    .child(div().font_semibold().child("学习卡片")),
-                            )
-                            .child(card_list),
-                    )
-                    .into_any_element()
-            } else {
-                empty_state(
-                    RuizIcon::NotebookText,
-                    "选择一篇笔记开始",
-                    "从左侧打开学习材料，或使用右上角的“导入材料”创建第一篇笔记。",
-                    None,
-                    cx,
+                                .items_center()
+                                .gap_2()
+                                .child(Icon::new(RuizIcon::NotebookText).size_4())
+                                .child(div().font_semibold().child("学习卡片")),
+                        )
+                        .child(card_list),
                 )
                 .into_any_element()
-            };
+        } else {
+            empty_state(
+                RuizIcon::NotebookText,
+                "选择一篇笔记开始",
+                "从左侧打开学习材料，或使用右上角的“导入材料”创建第一篇笔记。",
+                None,
+                cx,
+            )
+            .into_any_element()
+        };
 
         // 右侧详情滚动容器（外层 relative 挂滚动条，滚动条不随内容滚动）
         let detail_scrollable = div()
@@ -1385,24 +1487,6 @@ fn preview(content: &str, limit: usize) -> String {
     preview
 }
 
-fn stat_badge(
-    label: &'static str,
-    count: usize,
-    background: gpui::Hsla,
-    foreground: gpui::Hsla,
-) -> gpui::Div {
-    h_flex()
-        .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_full()
-        .bg(background)
-        .text_sm()
-        .text_color(foreground)
-        .child(label)
-        .child(div().font_semibold().child(count.to_string()))
-}
-
 fn importance_style(importance: &str, cx: &gpui::App) -> (&'static str, gpui::Hsla) {
     match importance {
         "core" => ("核心", cx.theme().red),
@@ -1420,5 +1504,34 @@ fn unit_type_label(unit_type: &str) -> &'static str {
         "boundary" => "边界",
         "application" => "应用",
         _ => "知识",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenerationScope;
+
+    #[test]
+    fn generation_scopes_are_cumulative() {
+        assert!(GenerationScope::Quick.includes(true, true));
+        assert!(!GenerationScope::Quick.includes(false, true));
+        assert!(GenerationScope::Recommended.includes(true, true));
+        assert!(GenerationScope::Recommended.includes(false, true));
+        assert!(!GenerationScope::Recommended.includes(false, false));
+        assert!(GenerationScope::Comprehensive.includes(false, false));
+    }
+
+    #[test]
+    fn generation_scope_matches_segment_index() {
+        assert_eq!(GenerationScope::from_index(0), Some(GenerationScope::Quick));
+        assert_eq!(
+            GenerationScope::from_index(1),
+            Some(GenerationScope::Recommended)
+        );
+        assert_eq!(
+            GenerationScope::from_index(2),
+            Some(GenerationScope::Comprehensive)
+        );
+        assert_eq!(GenerationScope::from_index(3), None);
     }
 }
