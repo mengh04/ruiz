@@ -1,0 +1,35 @@
+[package]
+name = "ruiz"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+directories = { version = "6.0" }
+fsrs = "6.6.1"
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "wayland",
+] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+    "webpki-roots",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "chrono",
+] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
