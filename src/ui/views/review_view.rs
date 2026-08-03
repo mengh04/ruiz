@@ -710,7 +710,8 @@ impl Render for ReviewView {
                 .id("review-scroll-wrap")
                 .relative()
                 .flex_1()
-                .h_full()
+                .min_h_0()
+                .w_full()
                 .child(
                     div()
                         .id("review-scroll")
