@@ -2,6 +2,7 @@
 //! 时间用 chrono，调度状态复用 fsrs 的类型。
 
 pub mod card;
+pub mod group;
 pub mod knowledge;
 pub mod note;
 pub mod review;

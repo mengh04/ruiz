@@ -10,20 +10,22 @@ use gpui_component::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use gpui_component::button::{Button, ButtonGroup, ButtonVariant, ButtonVariants as _};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
 use gpui_component::theme::ActiveTheme as _;
 use gpui_component::{
-    Icon, IconName, Placement, Root, Selectable as _, Sizable as _, StyledExt as _, WindowExt as _,
-    h_flex, v_flex,
+    Icon, IconName, IndexPath, Placement, Root, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 
 use crate::ai::progress::{ImportProgress, ImportStage};
 use crate::assets::RuizIcon;
 use crate::db;
 use crate::domain::card::Card;
+use crate::domain::group::StudyGroup;
 use crate::domain::knowledge::{KnowledgeUnit, MaterialAnalysis};
 use crate::domain::note::Note;
 use crate::state::AppState;
@@ -31,10 +33,14 @@ use crate::ui::components::{empty_state, page_header};
 
 pub struct NotesView {
     notes: Vec<Note>,
+    groups: Vec<StudyGroup>,
+    selected_group_id: Option<i64>,
+    import_group_selection_changed: bool,
     /// 笔记页内部导航状态，实体在切换主 Tab 时不会重建。
     page: NotesPage,
     cards: Vec<Card>,
     content: Entity<InputState>,
+    group_name_input: Entity<InputState>,
     analysis: Option<MaterialAnalysis>,
     units: Vec<KnowledgeUnit>,
     notes_loading: bool,
@@ -112,6 +118,24 @@ enum Message {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroupChoice {
+    id: i64,
+    name: SharedString,
+}
+
+impl SelectItem for GroupChoice {
+    type Value = i64;
+
+    fn title(&self) -> SharedString {
+        self.name.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+}
+
 impl NotesView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let window_handle = window.window_handle();
@@ -121,11 +145,17 @@ impl NotesView {
                 .multi_line(true)
                 .rows(16)
         });
+        let group_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("例如：计算机网络、Redis、Rust"));
         let mut view = Self {
             notes: Vec::new(),
+            groups: Vec::new(),
+            selected_group_id: None,
+            import_group_selection_changed: false,
             page: NotesPage::Library,
             cards: Vec::new(),
             content,
+            group_name_input,
             analysis: None,
             units: Vec::new(),
             notes_loading: true,
@@ -141,7 +171,40 @@ impl NotesView {
             detail_scroll: ScrollHandle::new(),
         };
         view.refresh_notes(cx);
+        view.refresh_groups(cx);
         view
+    }
+
+    fn refresh_groups(&mut self, cx: &mut Context<Self>) {
+        let pool = AppState::global(cx).pool.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
+                let this = this.clone();
+                let mut cx = (*cx).clone();
+                async move {
+                    let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
+                        db::groups::list(&pool).await
+                    })
+                    .await;
+                    if let Ok(groups) = result {
+                        this.update(&mut cx, |this, cx| {
+                            this.groups = groups;
+                            if this.selected_group_id.is_none()
+                                || !this
+                                    .groups
+                                    .iter()
+                                    .any(|g| Some(g.id) == this.selected_group_id)
+                            {
+                                this.selected_group_id = this.groups.first().map(|g| g.id);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     fn refresh_notes(&mut self, cx: &mut Context<Self>) {
@@ -254,7 +317,22 @@ impl NotesView {
             window.push_notification("请先在设置中配置 AI", cx);
             return false;
         };
+        let requested_group = self.group_name_input.read(cx).value().trim().to_string();
+        let requested_group = if self.import_group_selection_changed {
+            self.selected_group_id
+                .and_then(|id| self.groups.iter().find(|g| g.id == id))
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| "未分组".into())
+        } else if requested_group.is_empty() {
+            self.selected_group_id
+                .and_then(|id| self.groups.iter().find(|g| g.id == id))
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| "未分组".into())
+        } else {
+            requested_group
+        };
         self.importing = true;
+        self.import_group_selection_changed = false;
         self.import_progress = Some(ImportProgress::preparing());
         self.message = None;
         cx.notify();
@@ -296,7 +374,8 @@ impl NotesView {
                             ImportStage::Saving,
                             "AI 结果已经校验完成，正在原子写入资料库",
                         ));
-                        db::knowledge::save_import(&pool, &prepared).await
+                            let group_id = db::groups::get_or_create(&pool, &requested_group).await?;
+                            db::knowledge::save_import(&pool, group_id, &prepared).await
                     })
                     .await;
                     match result {
@@ -333,6 +412,7 @@ impl NotesView {
                                     "AI 已整理出 {material_count} 篇材料，并生成 {question_count} 张推荐卡片"
                                 )));
                                 this.refresh_notes(cx);
+                                this.refresh_groups(cx);
                                 if only_note.is_some() {
                                     this.refresh_cards(cx);
                                 }
@@ -396,14 +476,343 @@ impl NotesView {
         }
     }
 
+    fn open_change_note_group(
+        &mut self,
+        note_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(note) = self.notes.iter().find(|note| note.id == note_id) else {
+            return;
+        };
+        let choices = self
+            .groups
+            .iter()
+            .map(|group| GroupChoice {
+                id: group.id,
+                name: group.name.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        let selected = choices.iter().position(|choice| choice.id == note.group_id);
+        let current_name = choices
+            .get(selected.unwrap_or(0))
+            .map(|choice| choice.name.clone())
+            .unwrap_or_else(|| SharedString::from("未分组"));
+        let group_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("输入新分组名称")
+                .default_value(current_name)
+        });
+        let group_select = cx.new(|cx| {
+            SelectState::new(
+                choices.clone(),
+                selected.map(|index| IndexPath::default().row(index)),
+                window,
+                cx,
+            )
+        });
+        let choices_for_event = choices.clone();
+        let input_for_event = group_input.clone();
+        cx.subscribe_in(&group_select, window, move |_, _, event, window, cx| {
+            if let SelectEvent::Confirm(Some(id)) = event
+                && let Some(choice) = choices_for_event.iter().find(|choice| choice.id == *id)
+            {
+                input_for_event.update(cx, |input, cx| {
+                    input.set_value(choice.name.clone(), window, cx);
+                });
+            }
+        })
+        .detach();
+
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let save_view = view.clone();
+            let save_input = group_input.clone();
+            dialog
+                .title("修改笔记分组")
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div().text_sm().child(
+                                "选择已有分组，或输入新名称后保存。卡片和复习进度不会改变。",
+                            ),
+                        )
+                        .child(Select::new(&group_select).w_full())
+                        .child(Input::new(&group_input)),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel-change-note-group")
+                                .outline()
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("save-change-note-group")
+                                .primary()
+                                .label("保存")
+                                .on_click({
+                                    let save_view = save_view.clone();
+                                    let save_input = save_input.clone();
+                                    move |_, window, cx| {
+                                        let name = save_input.read(cx).value().trim().to_string();
+                                        if name.is_empty() {
+                                            window.push_notification("分组名称不能为空", cx);
+                                            return;
+                                        }
+                                        window.close_dialog(cx);
+                                        save_view.update(cx, |this, cx| {
+                                            this.move_note_to_group(note_id, name, cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+        });
+        cx.notify();
+    }
+
+    fn move_note_to_group(&mut self, note_id: i64, name: String, cx: &mut Context<Self>) {
+        let pool = AppState::global(cx).pool.clone();
+        self.message = None;
+        cx.spawn(
+            move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
+                let this = this.clone();
+                let mut cx = (*cx).clone();
+                async move {
+                    let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
+                        let group_id = db::groups::get_or_create(&pool, &name).await?;
+                        db::notes::move_to_group(&pool, note_id, group_id).await?;
+                        anyhow::Ok((group_id, name))
+                    })
+                    .await;
+                    this.update(&mut cx, |this, cx| {
+                        match result {
+                            Ok((group_id, name)) => {
+                                this.selected_group_id = Some(group_id);
+                                this.message =
+                                    Some(Message::Success(format!("笔记已移动到“{name}”分组")));
+                                this.refresh_notes(cx);
+                                this.refresh_groups(cx);
+                            }
+                            Err(error) => {
+                                this.message =
+                                    Some(Message::Error(format!("修改笔记分组失败: {error}")));
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn open_rename_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let choices = self
+            .groups
+            .iter()
+            .map(|group| GroupChoice {
+                id: group.id,
+                name: group.name.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        let selected = self
+            .selected_group_id
+            .and_then(|id| choices.iter().position(|choice| choice.id == id))
+            .or((!choices.is_empty()).then_some(0));
+        let current_name = selected
+            .and_then(|index| choices.get(index))
+            .map(|choice| choice.name.clone())
+            .unwrap_or_default();
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("输入新的分组名称")
+                .default_value(current_name)
+        });
+        let group_select = cx.new(|cx| {
+            SelectState::new(
+                choices.clone(),
+                selected.map(|index| IndexPath::default().row(index)),
+                window,
+                cx,
+            )
+        });
+        let choices_for_event = choices.clone();
+        let input_for_event = name_input.clone();
+        cx.subscribe_in(&group_select, window, move |_, _, event, window, cx| {
+            if let SelectEvent::Confirm(Some(id)) = event
+                && let Some(choice) = choices_for_event.iter().find(|choice| choice.id == *id)
+            {
+                input_for_event.update(cx, |input, cx| {
+                    input.set_value(choice.name.clone(), window, cx);
+                });
+            }
+        })
+        .detach();
+
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let save_view = view.clone();
+            let save_select = group_select.clone();
+            let save_input = name_input.clone();
+            dialog
+                .title("重命名分组")
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(Select::new(&group_select).w_full())
+                        .child(Input::new(&name_input)),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel-rename-group")
+                                .outline()
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("save-rename-group")
+                                .primary()
+                                .label("保存")
+                                .on_click({
+                                    let save_view = save_view.clone();
+                                    let save_select = save_select.clone();
+                                    let save_input = save_input.clone();
+                                    move |_, window, cx| {
+                                        let Some(group_id) =
+                                            save_select.read(cx).selected_value().copied()
+                                        else {
+                                            window.push_notification("请先选择分组", cx);
+                                            return;
+                                        };
+                                        let name = save_input.read(cx).value().trim().to_string();
+                                        if name.is_empty() {
+                                            window.push_notification("分组名称不能为空", cx);
+                                            return;
+                                        }
+                                        window.close_dialog(cx);
+                                        save_view.update(cx, |this, cx| {
+                                            this.rename_group(group_id, name, cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+        });
+        cx.notify();
+    }
+
+    fn rename_group(&mut self, group_id: i64, name: String, cx: &mut Context<Self>) {
+        let pool = AppState::global(cx).pool.clone();
+        self.message = None;
+        cx.spawn(
+            move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
+                let this = this.clone();
+                let mut cx = (*cx).clone();
+                async move {
+                    let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
+                        db::groups::rename(&pool, group_id, &name).await?;
+                        anyhow::Ok(name)
+                    })
+                    .await;
+                    this.update(&mut cx, |this, cx| {
+                        match result {
+                            Ok(name) => {
+                                this.selected_group_id = Some(group_id);
+                                this.message =
+                                    Some(Message::Success(format!("分组已重命名为“{name}”")));
+                                this.refresh_groups(cx);
+                            }
+                            Err(error) => {
+                                this.message =
+                                    Some(Message::Error(format!("重命名分组失败: {error}")));
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
     fn open_import_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let content = self.content.clone();
+        self.import_group_selection_changed = false;
+        let group_name_input = self.group_name_input.clone();
+        if let Some(group) = self
+            .selected_group_id
+            .and_then(|id| self.groups.iter().find(|group| group.id == id))
+        {
+            group_name_input.update(cx, |state, cx| {
+                state.set_value(group.name.clone(), window, cx);
+            });
+        }
+        let group_choices = self
+            .groups
+            .iter()
+            .map(|group| GroupChoice {
+                id: group.id,
+                name: group.name.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        let selected_group_id = self.selected_group_id;
         let view = cx.entity();
         let sheet_width = px((window.viewport_size().width.as_f32() - 24.).clamp(340., 680.));
-        window.open_sheet_at(Placement::Right, cx, move |sheet, _, cx| {
+        window.open_sheet_at(Placement::Right, cx, move |sheet, sheet_window, cx| {
             let save_view = view.clone();
             let cancel_view = view.clone();
             let close_view = view.clone();
+            let group_select = cx.new(|cx| {
+                let selected = selected_group_id.and_then(|id| {
+                    group_choices.iter().position(|choice| choice.id == id)
+                });
+                SelectState::new(
+                    group_choices.clone(),
+                    selected.map(|index| IndexPath::default().row(index)),
+                    sheet_window,
+                    cx,
+                )
+            });
+            let choices_for_event = group_choices.clone();
+            let parent_view = view.clone();
+            cx.subscribe(
+                &group_select,
+                move |_, event, cx| {
+                    if let SelectEvent::Confirm(Some(id)) = event {
+                        if choices_for_event.iter().any(|choice| choice.id == *id) {
+                            parent_view.update(cx, |this, cx| {
+                                this.selected_group_id = Some(*id);
+                                this.import_group_selection_changed = true;
+                                cx.notify();
+                            });
+                        }
+                    }
+                },
+            )
+            .detach();
+            let parent_view_for_input = view.clone();
+            cx.subscribe(&group_name_input, move |_, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    parent_view_for_input.update(cx, |this, cx| {
+                        this.import_group_selection_changed = false;
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
             sheet
                 .overlay(true)
                 .overlay_closable(true)
@@ -429,6 +838,30 @@ impl NotesView {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
                                     "直接粘贴原始网页、课程笔记或多篇 Markdown。AI 会自动去除导航与广告，拆分材料，生成标题、知识蓝图和推荐卡片。",
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().font_medium().child("学习分组"))
+                                .child(
+                                    Select::new(&group_select)
+                                        .w_full()
+                                        .placeholder("选择已有分组")
+                                        .empty(|_, cx| {
+                                            div()
+                                                .p_3()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("还没有分组，下面输入名称即可新建")
+                                        }),
+                                )
+                                .child(Input::new(&group_name_input).h(px(36.)))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("输入已有名称会归入该分组，输入新名称会自动创建分组。"),
                                 ),
                         )
                         .child(
@@ -723,6 +1156,16 @@ impl Render for NotesView {
                     h_flex()
                         .gap_2()
                         .child(
+                            Button::new("rename-group")
+                                .icon(IconName::Settings2)
+                                .label("重命名分组")
+                                .outline()
+                                .disabled(self.groups.is_empty())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_rename_group(window, cx);
+                                })),
+                        )
+                        .child(
                             Button::new("open-diagnostics")
                                 .icon(IconName::File)
                                 .label("日志")
@@ -927,6 +1370,12 @@ impl Render for NotesView {
                                 self.notes.iter().map(|note| {
                                     let id = note.id;
                                     let title = note.title.clone();
+                                    let group_name = self
+                                        .groups
+                                        .iter()
+                                        .find(|group| group.id == note.group_id)
+                                        .map(|group| group.name.clone())
+                                        .unwrap_or_else(|| "未分组".into());
                                     let created_at = note.created_at.format("%Y-%m-%d").to_string();
                                     let excerpt =
                                         preview(&note.content, if compact { 72 } else { 120 });
@@ -989,6 +1438,19 @@ impl Render for NotesView {
                                                                         .child(SharedString::from(
                                                                             title,
                                                                         )),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex_shrink_0()
+                                                                        .px_1p5()
+                                                                        .py_0p5()
+                                                                        .rounded_full()
+                                                                        .bg(colors
+                                                                            .primary
+                                                                            .opacity(0.1))
+                                                                        .text_xs()
+                                                                        .text_color(colors.primary)
+                                                                        .child(group_name),
                                                                 )
                                                                 .child(
                                                                     div()
@@ -1349,8 +1811,15 @@ impl Render for NotesView {
                                 .child(
                                     div().text_sm().text_color(colors.muted_foreground).child(
                                         note.map(|n| {
+                                            let group_name = self
+                                                .groups
+                                                .iter()
+                                                .find(|group| group.id == n.group_id)
+                                                .map(|group| group.name.clone())
+                                                .unwrap_or_else(|| "未分组".into());
                                             format!(
-                                                "创建于 {} · {} 个字符",
+                                                "分组：{} · 创建于 {} · {} 个字符",
+                                                group_name,
                                                 n.created_at.format("%Y-%m-%d"),
                                                 n.content.chars().count()
                                             )
@@ -1372,6 +1841,16 @@ impl Render for NotesView {
                                         .text_sm()
                                         .text_color(colors.muted_foreground)
                                         .child(format!("{} 张卡片", cards.len())),
+                                )
+                                .child(
+                                    Button::new("change-note-group")
+                                        .small()
+                                        .icon(IconName::Folder)
+                                        .label("修改分组")
+                                        .outline()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_change_note_group(id, window, cx);
+                                        })),
                                 )
                                 .child(
                                     Button::new("delete-note")

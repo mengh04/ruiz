@@ -45,6 +45,9 @@ impl MainView {
 
     fn switch(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.active = tab;
+        if tab == Tab::Review {
+            self.review.update(cx, |review, cx| review.load(cx));
+        }
         cx.notify();
     }
 

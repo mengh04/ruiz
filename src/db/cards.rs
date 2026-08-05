@@ -59,16 +59,34 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Card>> {
 }
 
 /// 到期（due <= now）的卡片，按到期时间升序 —— 复习队列。
+#[allow(dead_code)]
 pub async fn due(pool: &SqlitePool, now: DateTime<Utc>) -> Result<Vec<Card>> {
+    due_in_scope(pool, now, None, None).await
+}
+
+/// 查询指定分组或章节的到期卡片。分组筛选通过笔记章节归属实现，
+/// 因此“整个分组”和“单篇章节”始终复用同一套卡片与记忆状态。
+pub async fn due_in_scope(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    group_id: Option<i64>,
+    note_id: Option<i64>,
+) -> Result<Vec<Card>> {
     let rows = sqlx::query(
         "SELECT cards.*, card_knowledge_units.knowledge_unit_id,
                 knowledge_units.required_points_json
          FROM cards
          LEFT JOIN card_knowledge_units ON card_knowledge_units.card_id = cards.id
          LEFT JOIN knowledge_units ON knowledge_units.id = card_knowledge_units.knowledge_unit_id
-         WHERE cards.due <= ?1 ORDER BY cards.due ASC",
+         INNER JOIN notes ON notes.id = cards.note_id
+         WHERE cards.due <= ?1
+           AND (?2 IS NULL OR notes.group_id = ?2)
+           AND (?3 IS NULL OR cards.note_id = ?3)
+         ORDER BY cards.due ASC",
     )
     .bind(now.to_rfc3339())
+    .bind(group_id)
+    .bind(note_id)
     .fetch_all(pool)
     .await?;
     rows.iter().map(from_row).collect::<Result<Vec<_>>>()

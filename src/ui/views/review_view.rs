@@ -15,12 +15,16 @@ use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
 use gpui_component::theme::{ActiveTheme as _, ThemeColor};
-use gpui_component::{Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_component::{
+    Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
 
 use crate::ai::judge::Judgement;
 use crate::assets::RuizIcon;
 use crate::db;
 use crate::domain::card::Card;
+use crate::domain::group::GroupSummary;
+use crate::domain::note::Note;
 use crate::domain::review::Rating;
 use crate::scheduler::Scheduler;
 use crate::state::AppState;
@@ -40,6 +44,10 @@ enum Phase {
 
 pub struct ReviewView {
     queue: Vec<Card>,
+    groups: Vec<GroupSummary>,
+    notes: Vec<Note>,
+    selected_group_id: Option<i64>,
+    selected_note_id: Option<i64>,
     current: Option<Card>,
     phase: Phase,
     answer: Entity<InputState>,
@@ -63,6 +71,10 @@ impl ReviewView {
         });
         let mut view = Self {
             queue: Vec::new(),
+            groups: Vec::new(),
+            notes: Vec::new(),
+            selected_group_id: None,
+            selected_note_id: None,
             current: None,
             phase: Phase::Loading,
             answer,
@@ -76,8 +88,10 @@ impl ReviewView {
         view
     }
 
-    fn load(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load(&mut self, cx: &mut Context<Self>) {
         let pool = AppState::global(cx).pool.clone();
+        let group_id = self.selected_group_id;
+        let note_id = self.selected_note_id;
         self.phase = Phase::Loading;
         self.error = None;
         cx.notify();
@@ -87,12 +101,32 @@ impl ReviewView {
                 let mut cx = (*cx).clone();
                 async move {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
-                        db::cards::due(&pool, Utc::now()).await
+                        let groups = db::groups::summaries(&pool, Utc::now()).await?;
+                        let notes = db::notes::list(&pool).await?;
+                        let queue =
+                            db::cards::due_in_scope(&pool, Utc::now(), group_id, note_id).await?;
+                        anyhow::Ok((groups, notes, queue))
                     })
                     .await;
                     match result {
-                        Ok(queue) => {
+                        Ok((groups, notes, queue)) => {
                             this.update(&mut cx, |this, cx| {
+                                if this.selected_group_id.is_some_and(|id| {
+                                    !groups.iter().any(|summary| summary.group.id == id)
+                                }) {
+                                    this.selected_group_id = None;
+                                    this.selected_note_id = None;
+                                }
+                                if this.selected_note_id.is_some_and(|id| {
+                                    !notes.iter().any(|note| {
+                                        note.id == id
+                                            && Some(note.group_id) == this.selected_group_id
+                                    })
+                                }) {
+                                    this.selected_note_id = None;
+                                }
+                                this.groups = groups;
+                                this.notes = notes;
                                 this.queue = queue;
                                 this.current = this.queue.first().cloned();
                                 this.phase = if this.current.is_some() {
@@ -117,6 +151,17 @@ impl ReviewView {
             },
         )
         .detach();
+    }
+
+    fn select_group(&mut self, group_id: Option<i64>, cx: &mut Context<Self>) {
+        self.selected_group_id = group_id;
+        self.selected_note_id = None;
+        self.load(cx);
+    }
+
+    fn select_note(&mut self, note_id: Option<i64>, cx: &mut Context<Self>) {
+        self.selected_note_id = note_id;
+        self.load(cx);
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -317,6 +362,98 @@ impl Render for ReviewView {
             ),
             cx,
         );
+
+        let scope_bar = v_flex()
+            .w_full()
+            .gap_2()
+            .px_6()
+            .py_3()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(colors.muted_foreground)
+                            .child("复习分组"),
+                    )
+                    .child(
+                        Button::new("review-all-groups")
+                            .small()
+                            .outline()
+                            .selected(self.selected_group_id.is_none())
+                            .label("全部")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.select_group(None, cx);
+                            })),
+                    )
+                    .children(self.groups.iter().map(|summary| {
+                        let group_id = summary.group.id;
+                        Button::new(SharedString::from(format!("review-group-{group_id}")))
+                            .small()
+                            .outline()
+                            .selected(self.selected_group_id == Some(group_id))
+                            .label(format!(
+                                "{} · {} 章 · {} 张 · {} 到期",
+                                summary.group.name,
+                                summary.note_count,
+                                summary.card_count,
+                                summary.due_count
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_group(Some(group_id), cx);
+                            }))
+                    })),
+            )
+            .when_some(self.selected_group_id, |this, group_id| {
+                let all_selected = self.selected_note_id.is_none();
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(colors.muted_foreground)
+                                .child("章节"),
+                        )
+                        .child(
+                            Button::new("review-all-chapters")
+                                .small()
+                                .outline()
+                                .selected(all_selected)
+                                .label("全部章节")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.select_note(None, cx);
+                                })),
+                        )
+                        .children(
+                            self.notes
+                                .iter()
+                                .filter(move |note| note.group_id == group_id)
+                                .map(|note| {
+                                    let note_id = note.id;
+                                    Button::new(SharedString::from(format!(
+                                        "review-note-{note_id}"
+                                    )))
+                                    .small()
+                                    .outline()
+                                    .selected(self.selected_note_id == Some(note_id))
+                                    .label(note.title.clone())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_note(Some(note_id), cx);
+                                    }))
+                                }),
+                        ),
+                )
+            });
 
         let body: gpui::AnyElement = match &self.phase {
             Phase::Loading => v_flex()
@@ -705,7 +842,7 @@ impl Render for ReviewView {
         }
         .into_any_element();
 
-        v_flex().size_full().child(header).child(
+        v_flex().size_full().child(header).child(scope_bar).child(
             div()
                 .id("review-scroll-wrap")
                 .relative()

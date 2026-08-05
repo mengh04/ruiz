@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
     pub id: i64,
+    /// 所属分组（笔记是分组下的章节）。
+    pub group_id: i64,
     /// AI 根据正文生成的材料标题。
     pub title: String,
     /// 去除网页外壳、重复目录等噪声后的正文。

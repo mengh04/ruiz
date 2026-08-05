@@ -1,11 +1,19 @@
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 /// 建表语句（idempotent，可重复执行）。
 /// `cards.stability / difficulty` 可空：NULL = 新卡（尚未首次复习）。
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS study_groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS notes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id   INTEGER REFERENCES study_groups(id),
     title      TEXT NOT NULL,
     content    TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -99,7 +107,39 @@ CREATE INDEX IF NOT EXISTS idx_reviews_card ON reviews(card_id);
 pub async fn init(db_path: &str) -> Result<SqlitePool> {
     let pool = SqlitePool::connect(db_path).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+    migrate_groups(&pool).await?;
     Ok(pool)
+}
+
+async fn migrate_groups(pool: &SqlitePool) -> Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(notes)")
+        .fetch_all(pool)
+        .await?;
+    if !columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "group_id")
+    {
+        sqlx::query("ALTER TABLE notes ADD COLUMN group_id INTEGER REFERENCES study_groups(id)")
+            .execute(pool)
+            .await?;
+    }
+    let default_id: i64 = sqlx::query(
+        "INSERT INTO study_groups (name, created_at, updated_at)
+         VALUES ('未分组', datetime('now'), datetime('now'))
+         ON CONFLICT(name) DO UPDATE SET name = excluded.name
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await?
+    .get("id");
+    sqlx::query("UPDATE notes SET group_id = ?1 WHERE group_id IS NULL")
+        .bind(default_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_notes_group ON notes(group_id)")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,5 +283,114 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn groups_and_scoped_due_cards_roundtrip() {
+        let pool = init("sqlite::memory:").await.expect("内存库建表失败");
+        let network = db::groups::get_or_create(&pool, "计网").await.unwrap();
+        let redis = db::groups::get_or_create(&pool, "Redis").await.unwrap();
+        let network_chapter =
+            db::notes::create_in_group(&pool, network, "计网 第三章", "数据链路层")
+                .await
+                .unwrap();
+        let redis_chapter = db::notes::create_in_group(&pool, redis, "Redis 持久化", "RDB 与 AOF")
+            .await
+            .unwrap();
+        db::cards::insert(
+            &pool,
+            &Card::new(network_chapter, "PPP?".into(), "7E".into(), None),
+        )
+        .await
+        .unwrap();
+        db::cards::insert(
+            &pool,
+            &Card::new(redis_chapter, "AOF?".into(), "日志".into(), None),
+        )
+        .await
+        .unwrap();
+
+        let network_due = db::cards::due_in_scope(&pool, chrono::Utc::now(), Some(network), None)
+            .await
+            .unwrap();
+        assert_eq!(network_due.len(), 1);
+        assert_eq!(network_due[0].note_id, network_chapter);
+        assert_eq!(
+            db::cards::due_in_scope(
+                &pool,
+                chrono::Utc::now(),
+                Some(network),
+                Some(redis_chapter)
+            )
+            .await
+            .unwrap()
+            .len(),
+            0
+        );
+        let summary = db::groups::summaries(&pool, chrono::Utc::now())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.group.id == network)
+            .unwrap();
+        assert_eq!(summary.note_count, 1);
+        assert_eq!(summary.card_count, 1);
+        assert_eq!(summary.due_count, 1);
+
+        db::groups::rename(&pool, redis, "Redis 数据库")
+            .await
+            .unwrap();
+        db::notes::move_to_group(&pool, network_chapter, redis)
+            .await
+            .unwrap();
+        let moved = db::notes::get(&pool, network_chapter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.group_id, redis);
+        assert!(
+            db::groups::rename(&pool, redis, "计网").await.is_err(),
+            "不应允许重命名为已有分组"
+        );
+        assert_eq!(
+            db::cards::due_in_scope(&pool, chrono::Utc::now(), Some(redis), None)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "移动章节后，其卡片应出现在新分组队列中"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrates_existing_notes_into_default_group() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO notes (title, content, created_at, updated_at)
+             VALUES ('旧笔记', '旧内容', datetime('now'), datetime('now'));",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+        migrate_groups(&pool).await.unwrap();
+
+        let migrated = sqlx::query(
+            "SELECT g.name AS group_name
+             FROM notes n JOIN study_groups g ON g.id = n.group_id
+             WHERE n.title = '旧笔记'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(migrated.get::<String, _>("group_name"), "未分组");
     }
 }

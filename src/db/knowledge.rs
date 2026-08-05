@@ -18,6 +18,7 @@ pub struct ImportSummary {
 /// 原子地保存一次智能导入，避免 AI 工作流中途失败后留下半篇材料。
 pub async fn save_import(
     pool: &SqlitePool,
+    group_id: i64,
     prepared: &[PreparedMaterial],
 ) -> Result<ImportSummary> {
     let mut transaction = pool.begin().await?;
@@ -27,9 +28,10 @@ pub async fn save_import(
 
     for item in prepared {
         let note_id: i64 = sqlx::query(
-            "INSERT INTO notes (title, content, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3) RETURNING id",
+            "INSERT INTO notes (group_id, title, content, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4) RETURNING id",
         )
+        .bind(group_id)
         .bind(&item.material.title)
         .bind(&item.material.content)
         .bind(&now)
