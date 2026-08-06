@@ -979,14 +979,14 @@ impl NotesView {
             cx.subscribe(
                 &group_select,
                 move |_, event, cx| {
-                    if let SelectEvent::Confirm(Some(id)) = event {
-                        if choices_for_event.iter().any(|choice| choice.id == *id) {
-                            parent_view.update(cx, |this, cx| {
-                                this.selected_group_id = Some(*id);
-                                this.import_group_selection_changed = true;
-                                cx.notify();
-                            });
-                        }
+                    if let SelectEvent::Confirm(Some(id)) = event
+                        && choices_for_event.iter().any(|choice| choice.id == *id)
+                    {
+                        parent_view.update(cx, |this, cx| {
+                            this.selected_group_id = Some(*id);
+                            this.import_group_selection_changed = true;
+                            cx.notify();
+                        });
                     }
                 },
             )

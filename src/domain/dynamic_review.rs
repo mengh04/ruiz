@@ -60,7 +60,6 @@ impl MasteryBand {
 #[derive(Debug, Clone)]
 pub struct ReviewItem {
     pub unit_id: i64,
-    pub note_id: i64,
     pub note_title: String,
     pub topic: String,
     pub objective: String,
@@ -73,7 +72,6 @@ pub struct ReviewItem {
     pub fallback_answer: Option<String>,
     pub fallback_source: Option<String>,
     pub memory: Option<MemoryState>,
-    pub due: DateTime<Utc>,
     pub reps: u32,
     pub lapses: u32,
     pub last_review: Option<DateTime<Utc>>,
@@ -173,7 +171,6 @@ mod tests {
     fn item(reps: u32, lapses: u32, memory: Option<MemoryState>) -> ReviewItem {
         ReviewItem {
             unit_id: 1,
-            note_id: 1,
             note_title: "章节".into(),
             topic: "主题".into(),
             objective: "目标".into(),
@@ -186,7 +183,6 @@ mod tests {
             fallback_answer: None,
             fallback_source: None,
             memory,
-            due: Utc::now(),
             reps,
             lapses,
             last_review: None,

@@ -8,8 +8,6 @@ use std::{
 use anyhow::{Result, anyhow};
 use chrono::Local;
 
-const MAX_LOG_VALUE_CHARS: usize = 64_000;
-
 struct Diagnostics {
     file: Mutex<File>,
     directory: PathBuf,
@@ -79,14 +77,6 @@ pub fn open_log_directory() -> Result<()> {
         .map_err(|error| anyhow!("无法打开日志目录 {}: {error}", directory.display()))
 }
 
-pub fn truncate(value: &str) -> String {
-    let mut truncated = value.chars().take(MAX_LOG_VALUE_CHARS).collect::<String>();
-    if value.chars().count() > MAX_LOG_VALUE_CHARS {
-        truncated.push_str("\n...[truncated]");
-    }
-    truncated
-}
-
 fn write(level: &str, event: &str, message: &str, fields: serde_json::Value) {
     let entry = serde_json::json!({
         "timestamp": Local::now().to_rfc3339(),
@@ -106,18 +96,5 @@ fn write(level: &str, event: &str, message: &str, fields: serde_json::Value) {
             }
         }
         Err(_) => eprintln!("Ruiz diagnostics lock poisoned: {entry}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::truncate;
-
-    #[test]
-    fn truncates_large_log_values_on_character_boundaries() {
-        let input = "好".repeat(64_001);
-        let output = truncate(&input);
-        assert!(output.ends_with("...[truncated]"));
-        assert!(output.starts_with('好'));
     }
 }

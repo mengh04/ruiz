@@ -172,7 +172,6 @@ fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewItem> {
     };
     Ok(ReviewItem {
         unit_id: row.get("id"),
-        note_id: row.get("note_id"),
         note_title: row.get("note_title"),
         topic: row.get("topic"),
         objective: row.get("objective"),
@@ -185,7 +184,6 @@ fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewItem> {
         fallback_answer: row.get("fallback_answer"),
         fallback_source: row.get("fallback_source"),
         memory,
-        due: row.get::<DateTime<Utc>, _>("due"),
         reps: row.get::<i64, _>("reps") as u32,
         lapses: row.get::<i64, _>("lapses") as u32,
         last_review: row.get("last_review"),

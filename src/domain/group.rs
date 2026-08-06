@@ -14,7 +14,6 @@ pub struct StudyGroup {
 #[derive(Debug, Clone)]
 pub struct GroupSummary {
     pub group: StudyGroup,
-    pub note_count: usize,
     pub card_count: usize,
     pub due_count: usize,
 }

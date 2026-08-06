@@ -4,27 +4,6 @@ use sqlx::{Row, SqlitePool};
 
 use crate::domain::review::{Rating, Review};
 
-pub async fn insert(
-    pool: &SqlitePool,
-    card_id: i64,
-    user_answer: &str,
-    ai_feedback: &str,
-    rating: Rating,
-) -> Result<i64> {
-    let row = sqlx::query(
-        "INSERT INTO reviews (card_id, user_answer, ai_feedback, rating, reviewed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
-    )
-    .bind(card_id)
-    .bind(user_answer)
-    .bind(ai_feedback)
-    .bind(rating as i64)
-    .bind(Utc::now().to_rfc3339())
-    .fetch_one(pool)
-    .await?;
-    Ok(row.get("id"))
-}
-
 // 预留 CRUD API：后续功能（卡片历史）会用到
 #[allow(dead_code)]
 pub async fn by_card(pool: &SqlitePool, card_id: i64) -> Result<Vec<Review>> {

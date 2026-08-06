@@ -1,11 +1,9 @@
 use chrono::{DateTime, Utc};
-use fsrs::MemoryState;
 
 /// 一道兼容旧版数据的基础题：一个「问题 + 标准答案 + 原文引用」。
 /// 动态复习以关联知识单元上的 FSRS 状态为准。
 #[derive(Debug, Clone)]
 pub struct Card {
-    pub id: i64,
     #[allow(dead_code)]
     pub note_id: i64,
     pub question: String,
@@ -15,10 +13,6 @@ pub struct Card {
     /// 基础题关联的知识单元；旧数据会在数据库迁移时自动补建关联。
     #[allow(dead_code)]
     pub knowledge_unit_id: Option<i64>,
-    /// AI 判题时逐项检查的明确必答点。
-    pub required_points: Vec<String>,
-    /// FSRS 记忆状态；`None` 表示新卡（从未复习过）
-    pub memory: Option<MemoryState>,
     /// 下次到期时间（复习队列按此排序）
     #[allow(dead_code)]
     pub due: DateTime<Utc>,
@@ -26,8 +20,6 @@ pub struct Card {
     pub reps: u32,
     /// 累计遗忘（Again）次数
     pub lapses: u32,
-    /// 上次复习时间（新卡为 None）
-    pub last_review: Option<DateTime<Utc>>,
     /// 元数据（当前 UI 未展示，保留用于数据完整性）
     #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
@@ -46,28 +38,16 @@ impl Card {
     ) -> Self {
         let now = Utc::now();
         Self {
-            id: 0,
             note_id,
             question,
             standard_answer,
             source_excerpt,
             knowledge_unit_id: None,
-            required_points: Vec::new(),
-            memory: None,
             due: now,
             reps: 0,
             lapses: 0,
-            last_review: None,
             created_at: now,
             updated_at: now,
-        }
-    }
-
-    /// 距上次复习的天数（FSRS 的 delta_t；新卡返回 0）
-    pub fn days_elapsed(&self, now: DateTime<Utc>) -> u32 {
-        match self.last_review {
-            Some(last) => (now - last).num_days().max(0) as u32,
-            None => 0,
         }
     }
 }

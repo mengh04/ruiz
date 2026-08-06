@@ -30,7 +30,6 @@ pub async fn summaries(pool: &SqlitePool, now: DateTime<Utc>) -> Result<Vec<Grou
         .map(|row| {
             Ok(GroupSummary {
                 group: from_row(row)?,
-                note_count: row.get::<i64, _>("note_count") as usize,
                 card_count: row.get::<i64, _>("card_count") as usize,
                 due_count: row.get::<i64, _>("due_count") as usize,
             })
