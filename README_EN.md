@@ -70,4 +70,4 @@ Falls back to `./ruiz-data` in the current directory if none are available.
 
 ## License
 
-[MIT](./LICENSE)
+[Apache-2.0](./LICENSE)
