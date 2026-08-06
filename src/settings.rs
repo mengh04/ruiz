@@ -1,3 +1,5 @@
+use std::io::Write as _;
+
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
@@ -61,7 +63,19 @@ pub fn save_config(config: &Config) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(config).unwrap())?;
+    let serialized = serde_json::to_string_pretty(config).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+    file.write_all(serialized.as_bytes())?;
+    file.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

@@ -49,7 +49,6 @@ pub async fn prepare_import_with_progress(
         serde_json::json!({
             "material_count": materials.len(),
             "materials": materials.iter().map(|material| serde_json::json!({
-                "title": material.title,
                 "content_chars": material.content.chars().count(),
                 "document_type": material.document_type,
             })).collect::<Vec<_>>(),
@@ -64,7 +63,6 @@ pub async fn prepare_import_with_progress(
             "Knowledge planning started",
             serde_json::json!({
                 "material_index": index + 1,
-                "title": material.title,
                 "content_chars": material.content.chars().count(),
             }),
         );
@@ -82,7 +80,6 @@ pub async fn prepare_import_with_progress(
                 "Knowledge planning failed",
                 serde_json::json!({
                     "material_index": index + 1,
-                    "title": material.title,
                     "error": format!("{error:#}"),
                 }),
             );
@@ -111,11 +108,10 @@ pub async fn prepare_import_with_progress(
             "Knowledge plan is ready",
             serde_json::json!({
                 "material_index": index + 1,
-                "title": material.title,
                 "claims": plan.claims.len(),
                 "units": plan.units.len(),
                 "recommended_units": selected.len(),
-                "warnings": plan.warnings,
+                "warning_count": plan.warnings.len(),
             }),
         );
         planned.push((material, plan, selected));
@@ -139,7 +135,6 @@ pub async fn prepare_import_with_progress(
                 "Question generation failed",
                 serde_json::json!({
                     "material_index": index + 1,
-                    "title": material.title,
                     "unit_count": selected.len(),
                     "error": format!("{error:#}"),
                 }),

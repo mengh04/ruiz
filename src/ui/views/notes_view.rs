@@ -51,6 +51,8 @@ pub struct NotesView {
     import_progress: Option<ImportProgress>,
     import_thinking: String,
     import_thinking_chars: usize,
+    import_answer_preview: String,
+    import_answer_chars: usize,
     import_thinking_expanded: bool,
     import_started_at: Option<Instant>,
     import_cancellation: Option<ImportCancellation>,
@@ -173,6 +175,8 @@ impl NotesView {
             import_progress: None,
             import_thinking: String::new(),
             import_thinking_chars: 0,
+            import_answer_preview: String::new(),
+            import_answer_chars: 0,
             import_thinking_expanded: false,
             import_started_at: None,
             import_cancellation: None,
@@ -207,6 +211,22 @@ impl NotesView {
         if visible_chars > MAX_VISIBLE_CHARS {
             self.import_thinking = self
                 .import_thinking
+                .chars()
+                .skip(visible_chars - MAX_VISIBLE_CHARS)
+                .collect();
+        }
+    }
+
+    fn append_import_answer(&mut self, text: &str) {
+        const MAX_VISIBLE_CHARS: usize = 8_000;
+
+        let incoming_chars = text.chars().count();
+        self.import_answer_chars += incoming_chars;
+        self.import_answer_preview.push_str(text);
+        let visible_chars = self.import_answer_preview.chars().count();
+        if visible_chars > MAX_VISIBLE_CHARS {
+            self.import_answer_preview = self
+                .import_answer_preview
                 .chars()
                 .skip(visible_chars - MAX_VISIBLE_CHARS)
                 .collect();
@@ -391,6 +411,8 @@ impl NotesView {
         self.import_progress = Some(ImportProgress::preparing());
         self.import_thinking.clear();
         self.import_thinking_chars = 0;
+        self.import_answer_preview.clear();
+        self.import_answer_chars = 0;
         self.import_thinking_expanded = false;
         self.import_started_at = Some(Instant::now());
         self.import_cancellation = Some(cancellation.clone());
@@ -407,6 +429,7 @@ impl NotesView {
                 async move {
                     let mut pending_stage = None;
                     let mut pending_thinking = String::new();
+                    let mut pending_answer = String::new();
                     let mut last_update = Instant::now()
                         .checked_sub(Duration::from_millis(100))
                         .unwrap_or_else(Instant::now);
@@ -414,6 +437,7 @@ impl NotesView {
                         match event {
                             ImportEvent::Stage(progress) => pending_stage = Some(progress),
                             ImportEvent::Thinking(text) => pending_thinking.push_str(&text),
+                            ImportEvent::Answer(text) => pending_answer.push_str(&text),
                         }
                         let should_update = pending_stage.is_some()
                             || last_update.elapsed() >= Duration::from_millis(100)
@@ -423,6 +447,7 @@ impl NotesView {
                         }
                         let stage = pending_stage.take();
                         let thinking = std::mem::take(&mut pending_thinking);
+                        let answer = std::mem::take(&mut pending_answer);
                         this.update(&mut cx, |this, cx| {
                             if this.importing {
                                 if let Some(stage) = stage {
@@ -430,6 +455,9 @@ impl NotesView {
                                 }
                                 if !thinking.is_empty() {
                                     this.append_import_thinking(&thinking);
+                                }
+                                if !answer.is_empty() {
+                                    this.append_import_answer(&answer);
                                 }
                                 cx.notify();
                             }
@@ -441,6 +469,15 @@ impl NotesView {
                         this.update(&mut cx, |this, cx| {
                             if this.importing {
                                 this.append_import_thinking(&pending_thinking);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                    if !pending_answer.is_empty() {
+                        this.update(&mut cx, |this, cx| {
+                            if this.importing {
+                                this.append_import_answer(&pending_answer);
                                 cx.notify();
                             }
                         })
@@ -496,9 +533,8 @@ impl NotesView {
                             ImportStage::Saving,
                             "AI 结果已经校验完成，正在原子写入资料库",
                         )));
-                        let group_id = db::groups::get_or_create(&pool, &requested_group).await?;
                         task_cancellation.ensure_active()?;
-                        db::knowledge::save_import(&pool, group_id, &prepared).await
+                        db::knowledge::save_import(&pool, &requested_group, &prepared).await
                     })
                     .await;
                     match result {
@@ -531,6 +567,10 @@ impl NotesView {
                                 this.import_started_at = None;
                                 this.import_cancellation = None;
                                 this.import_cancelling = false;
+                                this.import_thinking.clear();
+                                this.import_thinking_chars = 0;
+                                this.import_answer_preview.clear();
+                                this.import_answer_chars = 0;
                                 this.page = only_note
                                     .map(NotesPage::Detail)
                                     .unwrap_or(NotesPage::Library);
@@ -566,6 +606,10 @@ impl NotesView {
                                 this.import_started_at = None;
                                 this.import_cancellation = None;
                                 this.import_cancelling = false;
+                                this.import_thinking.clear();
+                                this.import_thinking_chars = 0;
+                                this.import_answer_preview.clear();
+                                this.import_answer_chars = 0;
                                 this.message = if was_cancelled {
                                     Some(Message::Warning(
                                         "已取消智能导入，临时结果未写入资料库".into(),
@@ -1296,6 +1340,8 @@ impl Render for NotesView {
             .unwrap_or_else(|| "0 秒".into());
         let import_thinking = self.import_thinking.clone();
         let import_thinking_chars = self.import_thinking_chars;
+        let import_answer_preview = self.import_answer_preview.clone();
+        let import_answer_chars = self.import_answer_chars;
         let import_thinking_expanded = self.import_thinking_expanded;
         let import_cancelling = self.import_cancelling;
         let import_can_cancel = self
@@ -1574,21 +1620,69 @@ impl Render for NotesView {
                                         )
                                         .when(import_thinking_expanded, |this| {
                                             this.child(
-                                                div()
+                                                v_flex()
                                                     .w_full()
-                                                    .max_h(px(180.))
-                                                    .overflow_y_scrollbar()
-                                                    .p_2()
-                                                    .rounded_md()
-                                                    .bg(colors.muted)
-                                                    .text_xs()
-                                                    .text_color(colors.muted_foreground)
-                                                    .whitespace_normal()
-                                                    .child(if import_thinking.is_empty() {
-                                                        "正在等待模型返回思考内容…".into()
-                                                    } else {
-                                                        SharedString::from(import_thinking.clone())
-                                                    }),
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(colors.muted_foreground)
+                                                            .child(format!(
+                                                                "思考过程（{} 字符）",
+                                                                import_thinking_chars
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .max_h(px(180.))
+                                                            .overflow_y_scrollbar()
+                                                            .p_2()
+                                                            .rounded_md()
+                                                            .bg(colors.muted)
+                                                            .text_xs()
+                                                            .text_color(colors.muted_foreground)
+                                                            .whitespace_normal()
+                                                            .child(if import_thinking.is_empty() {
+                                                                "正在等待模型返回思考内容…".into()
+                                                            } else {
+                                                                SharedString::from(
+                                                                    import_thinking.clone(),
+                                                                )
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(colors.muted_foreground)
+                                                            .child(format!(
+                                                                "答案增量（{} 字符，仅临时预览）",
+                                                                import_answer_chars
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .max_h(px(120.))
+                                                            .overflow_y_scrollbar()
+                                                            .p_2()
+                                                            .rounded_md()
+                                                            .bg(colors.muted)
+                                                            .text_xs()
+                                                            .text_color(colors.muted_foreground)
+                                                            .whitespace_normal()
+                                                            .child(
+                                                                if import_answer_preview.is_empty()
+                                                                {
+                                                                    "正在等待模型返回答案…".into()
+                                                                } else {
+                                                                    SharedString::from(
+                                                                        import_answer_preview
+                                                                            .clone(),
+                                                                    )
+                                                                },
+                                                            ),
+                                                    ),
                                             )
                                         })
                                         .child(

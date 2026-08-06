@@ -18,11 +18,46 @@ pub struct ImportSummary {
 /// 原子地保存一次智能导入，避免 AI 工作流中途失败后留下半篇材料。
 pub async fn save_import(
     pool: &SqlitePool,
-    group_id: i64,
+    group_name: &str,
     prepared: &[PreparedMaterial],
 ) -> Result<ImportSummary> {
     let mut transaction = pool.begin().await?;
     let now = Utc::now().to_rfc3339();
+    let group_name = if group_name.trim().is_empty() {
+        "未分组"
+    } else {
+        group_name.trim()
+    };
+    let group_id: i64 = sqlx::query(
+        "INSERT INTO study_groups (name, created_at, updated_at)
+         VALUES (?1, ?2, ?2)
+         ON CONFLICT(name) DO UPDATE SET updated_at = excluded.updated_at
+         RETURNING id",
+    )
+    .bind(group_name)
+    .bind(&now)
+    .fetch_one(&mut *transaction)
+    .await?
+    .get("id");
+
+    if let Some(first) = prepared.first() {
+        let duplicate = sqlx::query(
+            "SELECT n.id
+             FROM notes n
+             JOIN material_analyses ma ON ma.note_id = n.id
+             WHERE n.group_id = ?1 AND ma.source_content = ?2
+             LIMIT 1",
+        )
+        .bind(group_id)
+        .bind(&first.material.raw_content)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if duplicate {
+            return Err(anyhow!("相同原始材料已经导入到分组“{group_name}”"));
+        }
+    }
+
     let mut note_ids = Vec::with_capacity(prepared.len());
     let mut question_count = 0;
 

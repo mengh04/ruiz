@@ -71,6 +71,7 @@ impl ImportProgress {
 pub enum ImportEvent {
     Stage(ImportProgress),
     Thinking(String),
+    Answer(String),
 }
 
 pub type ImportEventReporter = dyn Fn(ImportEvent) + Send + Sync;

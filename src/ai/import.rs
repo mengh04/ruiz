@@ -11,6 +11,7 @@ use super::{
 };
 
 const MAX_MATERIALS: usize = 20;
+const MAX_CLEAN_CHUNK_CHARS: usize = 80_000;
 
 #[derive(Debug, Clone)]
 pub struct ImportedMaterial {
@@ -74,44 +75,53 @@ pub async fn import_materials(
 ) -> Result<Vec<ImportedMaterial>> {
     cancellation.ensure_active()?;
     let source = normalize_source(raw)?;
+    let chunks = split_clean_chunks(&source);
     progress(ImportEvent::Stage(ImportProgress::stage(
         ImportStage::Cleaning,
         format!(
-            "正在一次性清洗整篇材料（{} 个字符），移除导航、广告和重复目录",
-            source.chars().count()
+            "正在分段清洗材料（{} 个字符，共 {} 段），移除导航、广告和重复目录",
+            source.chars().count(),
+            chunks.len()
         ),
     )));
-    let input = serde_json::json!({ "raw_source": source });
-    let report_stream = |event| {
-        if let StreamEvent::Thinking(text) = event {
-            progress(ImportEvent::Thinking(text));
-        }
+    let report_stream = |event| match event {
+        StreamEvent::Thinking(text) => progress(ImportEvent::Thinking(text)),
+        StreamEvent::Content(text) => progress(ImportEvent::Answer(text)),
     };
-    let value = client
-        .chat_json_stream_for(
-            "import.clean",
-            IMPORT_CLEAN_SYSTEM,
-            &input.to_string(),
-            &report_stream,
-            Some(cancellation),
-        )
-        .await?;
-    let response: CleanResponse =
-        serde_json::from_value(value).map_err(|error| anyhow!("材料清洗响应格式不对: {error}"))?;
     let mut stored = Vec::new();
-    for (index, fragment) in response.fragments.into_iter().enumerate() {
-        let key = fragment.material_key.trim();
-        let content = fragment.content.trim();
-        if key.is_empty() || content.is_empty() {
-            continue;
-        }
-        stored.push(StoredFragment {
-            id: format!("fragment-{}", stored.len() + 1),
-            key: key.chars().take(80).collect(),
-            title_hint: fragment.title_hint.trim().chars().take(100).collect(),
-            content: content.to_string(),
-            source_order: index,
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        cancellation.ensure_active()?;
+        let input = serde_json::json!({
+            "chunk_index": chunk_index + 1,
+            "chunk_count": chunks.len(),
+            "raw_source": chunk,
         });
+        let value = client
+            .chat_json_stream_for(
+                "import.clean",
+                IMPORT_CLEAN_SYSTEM,
+                &input.to_string(),
+                &report_stream,
+                Some(cancellation),
+            )
+            .await?;
+        let response: CleanResponse = serde_json::from_value(value).map_err(|error| {
+            anyhow!("材料清洗响应格式不对（第 {} 段）: {error}", chunk_index + 1)
+        })?;
+        for (index, fragment) in response.fragments.into_iter().enumerate() {
+            let key = fragment.material_key.trim();
+            let content = fragment.content.trim();
+            if key.is_empty() || content.is_empty() {
+                continue;
+            }
+            stored.push(StoredFragment {
+                id: format!("fragment-{}", stored.len() + 1),
+                key: key.chars().take(80).collect(),
+                title_hint: fragment.title_hint.trim().chars().take(100).collect(),
+                content: content.to_string(),
+                source_order: chunk_index * MAX_CLEAN_CHUNK_CHARS + index,
+            });
+        }
     }
 
     cancellation.ensure_active()?;
@@ -228,5 +238,74 @@ fn non_empty(value: String, fallback: &str, max: usize) -> String {
         fallback.to_string()
     } else {
         value.chars().take(max).collect()
+    }
+}
+
+fn split_clean_chunks(source: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0;
+
+    for paragraph in source
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+    {
+        let paragraph_chars = paragraph.chars().count();
+        if paragraph_chars > MAX_CLEAN_CHUNK_CHARS {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+            let mut piece = String::new();
+            for character in paragraph.chars() {
+                piece.push(character);
+                if piece.chars().count() >= MAX_CLEAN_CHUNK_CHARS {
+                    chunks.push(std::mem::take(&mut piece));
+                }
+            }
+            if !piece.is_empty() {
+                chunks.push(piece);
+            }
+            continue;
+        }
+
+        let separator_chars = if current.is_empty() { 0 } else { 2 };
+        if current_chars + separator_chars + paragraph_chars > MAX_CLEAN_CHUNK_CHARS
+            && !current.is_empty()
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+            current_chars += 2;
+        }
+        current.push_str(paragraph);
+        current_chars += paragraph_chars;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_clean_chunks;
+
+    #[test]
+    fn long_sources_are_split_without_dropping_paragraphs() {
+        let source = format!("{}\n\n{}", "甲".repeat(50_000), "乙".repeat(50_000));
+        let chunks = split_clean_chunks(&source);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks.concat().chars().filter(|c| *c == '甲').count(),
+            50_000
+        );
+        assert_eq!(
+            chunks.concat().chars().filter(|c| *c == '乙').count(),
+            50_000
+        );
     }
 }

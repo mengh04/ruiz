@@ -459,6 +459,15 @@ mod tests {
             .unwrap();
         assert_eq!(mapped.required_points, vec!["标志字段为 0x7E"]);
 
+        let imported = db::knowledge::save_import(&pool, "智能导入", &[prepared.clone()])
+            .await
+            .unwrap();
+        assert_eq!(imported.note_ids.len(), 1);
+        let duplicate = db::knowledge::save_import(&pool, "智能导入", &[prepared.clone()])
+            .await
+            .expect_err("同一分组不应重复导入相同原始材料");
+        assert!(duplicate.to_string().contains("相同原始材料"));
+
         // 删除笔记时同时清理卡片和复习记录。
         db::notes::delete(&pool, note_id).await.unwrap();
         assert!(db::notes::get(&pool, note_id).await.unwrap().is_none());

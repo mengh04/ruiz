@@ -1,6 +1,6 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -14,6 +14,8 @@ pub const DEEPSEEK_API_BASE: &str = "https://api.deepseek.com";
 pub const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 pub const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 384_000;
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REQUEST_ATTEMPTS: usize = 3;
 
 /// DeepSeek Chat Completions 客户端。
 #[derive(Clone)]
@@ -100,7 +102,7 @@ impl ChatClient {
         let response = self
             .send_request(request_id, operation, &url, &body)
             .await?;
-        let mut response = read_response(request_id, operation, response).await?;
+        let mut response = read_response(request_id, operation, response, None).await?;
 
         let mut content = response_content(request_id, operation, &response)?;
         if content.trim().is_empty() {
@@ -118,7 +120,7 @@ impl ChatClient {
             let retry = self
                 .send_request(request_id, operation, &url, &body)
                 .await?;
-            response = read_response(request_id, operation, retry).await?;
+            response = read_response(request_id, operation, retry, None).await?;
             content = response_content(request_id, operation, &response)?;
         }
         if content.trim().is_empty() {
@@ -140,7 +142,6 @@ impl ChatClient {
                 "request_id": request_id,
                 "operation": operation,
                 "content_chars": content.chars().count(),
-                "content": diagnostics::truncate(&content),
             }),
         );
         let parsed = parse_json_content(&content).map_err(|error| {
@@ -151,7 +152,6 @@ impl ChatClient {
                     "request_id": request_id,
                     "operation": operation,
                     "error": format!("{error:#}"),
-                    "content": diagnostics::truncate(&content),
                 }),
             );
             anyhow!("模型输出不是合法 JSON（请求 #{request_id}）：{error}")
@@ -247,7 +247,6 @@ impl ChatClient {
                 "request_id": request_id,
                 "operation": operation,
                 "content_chars": output.content.chars().count(),
-                "content": diagnostics::truncate(&output.content),
             }),
         );
         let parsed = parse_json_content(&output.content).map_err(|error| {
@@ -258,7 +257,6 @@ impl ChatClient {
                     "request_id": request_id,
                     "operation": operation,
                     "error": format!("{error:#}"),
-                    "content": diagnostics::truncate(&output.content),
                 }),
             );
             anyhow!("模型输出不是合法 JSON（请求 #{request_id}）：{error}")
@@ -289,15 +287,8 @@ impl ChatClient {
         body: &serde_json::Value,
         cancellation: Option<&ImportCancellation>,
     ) -> Result<Response> {
-        let request = self.send_request(request_id, operation, url, body);
-        if let Some(cancellation) = cancellation {
-            tokio::select! {
-                response = request => response,
-                _ = cancellation.cancelled() => Err(anyhow!("导入任务已取消")),
-            }
-        } else {
-            request.await
-        }
+        self.send_request_with_retry(request_id, operation, url, body, cancellation)
+            .await
     }
 
     async fn send_request(
@@ -307,24 +298,130 @@ impl ChatClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<Response> {
-        self.http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
+        self.send_request_with_retry(request_id, operation, url, body, None)
             .await
-            .map_err(|error| {
-                diagnostics::error(
-                    "ai.request.send_failed",
-                    "Failed to send AI request",
-                    serde_json::json!({
-                        "request_id": request_id,
-                        "operation": operation,
-                        "error": format!("{error:#}"),
-                    }),
-                );
-                anyhow!("AI 请求发送失败（请求 #{request_id}）：{error}")
-            })
+    }
+
+    async fn send_request_with_retry(
+        &self,
+        request_id: u64,
+        operation: &str,
+        url: &str,
+        body: &serde_json::Value,
+        cancellation: Option<&ImportCancellation>,
+    ) -> Result<Response> {
+        let timeout = request_timeout_for(operation);
+        for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+            let request = self
+                .http
+                .post(url)
+                .bearer_auth(&self.api_key)
+                .timeout(timeout)
+                .json(body)
+                .send();
+            let result = if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    response = request => response,
+                    _ = cancellation.cancelled() => {
+                        return Err(anyhow!("导入任务已取消"));
+                    }
+                }
+            } else {
+                request.await
+            };
+
+            match result {
+                Ok(response)
+                    if is_retryable_status(response.status()) && attempt < MAX_REQUEST_ATTEMPTS =>
+                {
+                    let delay = retry_delay(attempt);
+                    diagnostics::warn(
+                        "ai.request.retrying",
+                        "Transient AI response; retrying request",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "operation": operation,
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "status": response.status().as_u16(),
+                            "retry_delay_ms": delay.as_millis(),
+                        }),
+                    );
+                    wait_before_retry(delay, cancellation).await?;
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < MAX_REQUEST_ATTEMPTS => {
+                    diagnostics::warn(
+                        "ai.request.retrying",
+                        "Transient AI transport error; retrying request",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "operation": operation,
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                    wait_before_retry(retry_delay(attempt), cancellation).await?;
+                }
+                Err(error) => {
+                    diagnostics::error(
+                        "ai.request.send_failed",
+                        "Failed to send AI request",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "operation": operation,
+                            "attempt": attempt,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                    return Err(anyhow!("AI 请求发送失败（请求 #{request_id}）：{error}"));
+                }
+            }
+        }
+        unreachable!("AI request retry loop must return a response or error")
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_EARLY
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(250 * 2u64.saturating_pow((attempt.saturating_sub(1)) as u32))
+}
+
+async fn wait_before_retry(
+    delay: Duration,
+    cancellation: Option<&ImportCancellation>,
+) -> Result<()> {
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Ok(()),
+            _ = cancellation.cancelled() => Err(anyhow!("导入任务已取消")),
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+}
+
+fn request_timeout_for(operation: &str) -> Duration {
+    if operation.starts_with("review.question.generate") {
+        Duration::from_secs(90)
+    } else if operation.starts_with("answer.judge") {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(300)
     }
 }
 
@@ -387,13 +484,12 @@ fn response_parts(
                 "operation": operation,
                 "status": response.status.as_u16(),
                 "content_type": response.content_type,
-                "response_body": diagnostics::truncate(&response.body),
             }),
         );
         return Err(anyhow!(
-            "AI API 请求失败（请求 #{request_id}，状态 {}）：{}",
+            "AI API 请求失败（请求 #{request_id}，状态 {}，响应正文 {} 字符）",
             response.status,
-            diagnostics::truncate(&response.body)
+            response.body.chars().count()
         ));
     }
 
@@ -407,7 +503,7 @@ fn response_parts(
                 "status": response.status.as_u16(),
                 "content_type": response.content_type,
                 "error": error.to_string(),
-                "response_body": diagnostics::truncate(&response.body),
+                "body_chars": response.body.chars().count(),
             }),
         );
         anyhow!("AI API 响应不是合法 JSON（请求 #{request_id}）：{error}")
@@ -435,7 +531,7 @@ fn response_parts(
             serde_json::json!({
                 "request_id": request_id,
                 "operation": operation,
-                "response_body": diagnostics::truncate(&response.body),
+                "body_chars": response.body.chars().count(),
             }),
         );
         anyhow!("AI 响应缺少消息正文（请求 #{request_id}）")
@@ -447,6 +543,7 @@ async fn read_response(
     request_id: u64,
     operation: &str,
     response: Response,
+    cancellation: Option<&ImportCancellation>,
 ) -> Result<ResponseText> {
     let status = response.status();
     let content_type = response
@@ -472,23 +569,15 @@ async fn read_response(
         })
         .unwrap_or("unknown")
         .to_string();
-    let body = response.text().await.map_err(|error| {
-        diagnostics::error(
-            "ai.response.body_read_failed",
-            "Failed to read AI response body",
-            serde_json::json!({
-                "request_id": request_id,
-                "operation": operation,
-                "status": status.as_u16(),
-                "content_type": content_type,
-                "content_length": content_length,
-                "content_encoding": content_encoding,
-                "provider_request_id": provider_request_id,
-                "error": format!("{error:#}"),
-            }),
-        );
-        anyhow!("读取 AI 响应正文失败（请求 #{request_id}，状态 {status}）：{error}")
-    })?;
+    let body = read_limited_body(
+        response,
+        request_id,
+        operation,
+        status,
+        &content_type,
+        cancellation,
+    )
+    .await?;
     diagnostics::info(
         "ai.response.received",
         "AI HTTP response received",
@@ -510,6 +599,64 @@ async fn read_response(
     })
 }
 
+async fn read_limited_body(
+    mut response: Response,
+    request_id: u64,
+    operation: &str,
+    status: StatusCode,
+    content_type: &str,
+    cancellation: Option<&ImportCancellation>,
+) -> Result<String> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                chunk = response.chunk() => chunk,
+                _ = cancellation.cancelled() => return Err(anyhow!("导入任务已取消")),
+            }
+        } else {
+            response.chunk().await
+        };
+        let Some(chunk) = chunk.map_err(|error| {
+            diagnostics::error(
+                "ai.response.body_read_failed",
+                "Failed to read AI response body",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "operation": operation,
+                    "status": status.as_u16(),
+                    "content_type": content_type,
+                    "error": format!("{error:#}"),
+                }),
+            );
+            anyhow!("读取 AI 响应正文失败（请求 #{request_id}，状态 {status}）：{error}")
+        })?
+        else {
+            break;
+        };
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
+            diagnostics::error(
+                "ai.response.too_large",
+                "AI response exceeded the configured byte limit",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "operation": operation,
+                    "status": status.as_u16(),
+                    "content_type": content_type,
+                    "max_response_bytes": MAX_RESPONSE_BYTES,
+                }),
+            );
+            return Err(anyhow!(
+                "AI 响应超过 {} MB 限制（请求 #{request_id}）",
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body)
+        .map_err(|error| anyhow!("AI 响应包含无效 UTF-8（请求 #{request_id}）：{error}"))
+}
+
 async fn read_stream_response(
     request_id: u64,
     operation: &str,
@@ -526,7 +673,7 @@ async fn read_stream_response(
         .to_string();
 
     if !status.is_success() || !content_type.contains("text/event-stream") {
-        let response = read_response(request_id, operation, response).await?;
+        let response = read_response(request_id, operation, response, cancellation).await?;
         let payload = serde_json::from_str::<serde_json::Value>(&response.body).ok();
         let (reasoning, content) = response_parts(request_id, operation, &response)?;
         if !reasoning.is_empty() {
@@ -587,6 +734,24 @@ async fn read_stream_response(
         let Some(chunk) = chunk else {
             break;
         };
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body_bytes) {
+            diagnostics::error(
+                "ai.response.too_large",
+                "Streaming AI response exceeded the configured byte limit",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "operation": operation,
+                    "status": status.as_u16(),
+                    "content_type": content_type,
+                    "body_bytes": body_bytes,
+                    "max_response_bytes": MAX_RESPONSE_BYTES,
+                }),
+            );
+            return Err(anyhow!(
+                "AI 流式响应超过 {} MB 限制（请求 #{request_id}）",
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            ));
+        }
         body_bytes += chunk.len();
         buffer.extend_from_slice(&chunk);
         while let Some(frame) = take_sse_frame(&mut buffer) {
@@ -766,10 +931,14 @@ fn parse_json_content(content: &str) -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use reqwest::StatusCode;
+
     use super::{
-        DEEPSEEK_FLASH_MODEL, SseFrame, extract_message_content, json_request_body,
-        max_output_tokens_for, parse_json_content, parse_sse_frame, reasoning_effort_for,
-        take_sse_frame,
+        DEEPSEEK_FLASH_MODEL, SseFrame, extract_message_content, is_retryable_status,
+        json_request_body, max_output_tokens_for, parse_json_content, parse_sse_frame,
+        reasoning_effort_for, request_timeout_for, retry_delay, take_sse_frame,
     };
 
     #[test]
@@ -828,6 +997,16 @@ mod tests {
         assert_eq!(reasoning_effort_for("plan.reconcile"), "high");
         assert_eq!(reasoning_effort_for("plan.repair"), "high");
         assert_eq!(reasoning_effort_for("answer.judge"), "high");
+    }
+
+    #[test]
+    fn request_policy_retries_only_transient_failures() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert_eq!(retry_delay(1), Duration::from_millis(250));
+        assert_eq!(retry_delay(3), Duration::from_millis(1_000));
+        assert!(request_timeout_for("plan.extract") > request_timeout_for("answer.judge"));
     }
 
     #[test]

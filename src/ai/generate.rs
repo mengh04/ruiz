@@ -10,6 +10,8 @@ use super::{
     prompts::GENERATE_SYSTEM,
 };
 
+const MAX_GENERATION_UNITS: usize = 40;
+
 /// AI 出题得到的一道题，以及它对应的知识单元和必答点。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
@@ -45,33 +47,45 @@ pub async fn generate_questions_with_progress(
     if units.is_empty() {
         return Ok(Vec::new());
     }
-    progress(ImportEvent::Stage(ImportProgress::stage(
-        ImportStage::Generating,
-        format!(
-            "正在一次性为《{material_title}》生成全部 {} 道复习基础题",
-            units.len()
-        ),
-    )));
-    let input = serde_json::json!({ "units": units });
-    let report_stream = |event| {
-        if let StreamEvent::Thinking(text) = event {
-            progress(ImportEvent::Thinking(text));
-        }
-    };
-    let value = client
-        .chat_json_stream_for(
-            "questions.generate",
-            GENERATE_SYSTEM,
-            &input.to_string(),
-            &report_stream,
-            Some(cancellation),
-        )
-        .await?;
-    let response: QuestionResponse =
-        serde_json::from_value(value).map_err(|error| anyhow!("出题响应格式不对: {error}"))?;
-    validate_questions(units, &response.questions)?;
+    let batch_count = units.len().div_ceil(MAX_GENERATION_UNITS);
+    let mut generated_questions = Vec::with_capacity(units.len());
+    for (batch_index, batch) in units.chunks(MAX_GENERATION_UNITS).enumerate() {
+        cancellation.ensure_active()?;
+        progress(ImportEvent::Stage(ImportProgress::stage(
+            ImportStage::Generating,
+            format!(
+                "正在为《{material_title}》生成基础题（第 {}/{} 批，共 {} 道）",
+                batch_index + 1,
+                batch_count,
+                units.len()
+            ),
+        )));
+        let input = serde_json::json!({
+            "batch_index": batch_index + 1,
+            "batch_count": batch_count,
+            "units": batch,
+        });
+        let report_stream = |event| match event {
+            StreamEvent::Thinking(text) => progress(ImportEvent::Thinking(text)),
+            StreamEvent::Content(text) => progress(ImportEvent::Answer(text)),
+        };
+        let value = client
+            .chat_json_stream_for(
+                "questions.generate",
+                GENERATE_SYSTEM,
+                &input.to_string(),
+                &report_stream,
+                Some(cancellation),
+            )
+            .await?;
+        let response: QuestionResponse = serde_json::from_value(value)
+            .map_err(|error| anyhow!("出题响应格式不对（第 {} 批）: {error}", batch_index + 1))?;
+        validate_questions(batch, &response.questions)?;
+        generated_questions.extend(response.questions);
+    }
+    validate_questions(units, &generated_questions)?;
     let mut generated = HashMap::<String, Question>::new();
-    for mut question in response.questions {
+    for mut question in generated_questions {
         let unit = units
             .iter()
             .find(|unit| unit.id == question.unit_id)
