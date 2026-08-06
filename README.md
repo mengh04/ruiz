@@ -1,3 +1,5 @@
+[中文](./README.md) · [English](./README_EN.md)
+
 # Ruiz
 
 一个基于 [gpui](https://github.com/zed-industries/zed) 的 AI 学习记忆桌面应用：把任意学习材料交给 AI 智能导入，自动整理成知识蓝图并生成复习卡片，再用 [FSRS](https://github.com/open-spaced-repetition/fsrs4anki/wiki) 间隔重复算法安排复习，让记忆事半功倍。
