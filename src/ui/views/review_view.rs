@@ -1,4 +1,4 @@
-//! 复习视图：展示到期卡片 → 用户敲字作答 → AI 判官 → FSRS 调度。
+//! 动态复习视图：知识单元调度 → 自适应题型 → AI 动态题面 → 判分 → FSRS。
 
 use chrono::Utc;
 use fsrs::NextStates;
@@ -19,19 +19,22 @@ use gpui_component::{
     Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 
+use crate::ai::client::ChatClient;
 use crate::ai::judge::Judgement;
 use crate::assets::RuizIcon;
 use crate::db;
-use crate::domain::card::Card;
+use crate::domain::dynamic_review::{QuestionFormat, ReviewItem, ReviewPrompt};
 use crate::domain::group::GroupSummary;
 use crate::domain::note::Note;
 use crate::domain::review::Rating;
 use crate::scheduler::Scheduler;
+use crate::settings::AppSettings;
 use crate::state::AppState;
 use crate::ui::components::{empty_state, page_header};
 
 enum Phase {
     Loading,
+    Ready,
     Answering,
     Judging,
     Scheduling,
@@ -42,21 +45,33 @@ enum Phase {
     Finished,
 }
 
+#[derive(Clone)]
+struct PreparedPrompt {
+    prompt: ReviewPrompt,
+    notice: Option<String>,
+    adaptive_answer_formats: bool,
+}
+
 pub struct ReviewView {
-    queue: Vec<Card>,
+    queue: Vec<ReviewItem>,
     groups: Vec<GroupSummary>,
     notes: Vec<Note>,
     selected_group_id: Option<i64>,
     selected_note_id: Option<i64>,
-    current: Option<Card>,
+    current: Option<ReviewItem>,
+    prompt: Option<ReviewPrompt>,
+    selected_option: Option<String>,
     phase: Phase,
     answer: Entity<InputState>,
     error: Option<String>,
+    generation_notice: Option<String>,
+    prefetched: Option<PreparedPrompt>,
+    preparing_unit_id: Option<i64>,
+    prefetching_unit_id: Option<i64>,
+    load_revision: u64,
     show_source: bool,
     submitted_answer: String,
-    /// 窗口句柄（清空输入框等窗口操作需要）
     window: AnyWindowHandle,
-    /// 内容区滚动
     scroll: ScrollHandle,
 }
 
@@ -76,9 +91,16 @@ impl ReviewView {
             selected_group_id: None,
             selected_note_id: None,
             current: None,
+            prompt: None,
+            selected_option: None,
             phase: Phase::Loading,
             answer,
             error: None,
+            generation_notice: None,
+            prefetched: None,
+            preparing_unit_id: None,
+            prefetching_unit_id: None,
+            load_revision: 0,
             show_source: false,
             submitted_answer: String::new(),
             window: window_handle,
@@ -92,8 +114,17 @@ impl ReviewView {
         let pool = AppState::global(cx).pool.clone();
         let group_id = self.selected_group_id;
         let note_id = self.selected_note_id;
+        self.load_revision = self.load_revision.wrapping_add(1);
+        let revision = self.load_revision;
         self.phase = Phase::Loading;
+        self.queue.clear();
+        self.current = None;
+        self.prompt = None;
+        self.prefetched = None;
+        self.preparing_unit_id = None;
+        self.prefetching_unit_id = None;
         self.error = None;
+        self.generation_notice = None;
         cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
@@ -104,13 +135,17 @@ impl ReviewView {
                         let groups = db::groups::summaries(&pool, Utc::now()).await?;
                         let notes = db::notes::list(&pool).await?;
                         let queue =
-                            db::cards::due_in_scope(&pool, Utc::now(), group_id, note_id).await?;
+                            db::dynamic_reviews::due_in_scope(&pool, Utc::now(), group_id, note_id)
+                                .await?;
                         anyhow::Ok((groups, notes, queue))
                     })
                     .await;
                     match result {
                         Ok((groups, notes, queue)) => {
                             this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision {
+                                    return;
+                                }
                                 if this.selected_group_id.is_some_and(|id| {
                                     !groups.iter().any(|summary| summary.group.id == id)
                                 }) {
@@ -129,18 +164,23 @@ impl ReviewView {
                                 this.notes = notes;
                                 this.queue = queue;
                                 this.current = this.queue.first().cloned();
-                                this.phase = if this.current.is_some() {
-                                    Phase::Answering
+                                if this.current.is_some() {
+                                    // 先停在 Ready：等用户点击「开始复习」才调用 AI 生成题面。
+                                    this.phase = Phase::Ready;
+                                    cx.notify();
                                 } else {
-                                    Phase::Finished
-                                };
-                                cx.notify();
+                                    this.phase = Phase::Finished;
+                                    cx.notify();
+                                }
                             })
                             .ok();
                         }
-                        Err(e) => {
+                        Err(error) => {
                             this.update(&mut cx, |this, cx| {
-                                this.error = Some(format!("加载复习队列失败: {e}"));
+                                if this.load_revision != revision {
+                                    return;
+                                }
+                                this.error = Some(format!("加载复习队列失败: {error}"));
                                 this.phase = Phase::Finished;
                                 cx.notify();
                             })
@@ -151,6 +191,215 @@ impl ReviewView {
             },
         )
         .detach();
+    }
+
+    fn prepare_current(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.current.clone() else {
+            self.phase = Phase::Finished;
+            cx.notify();
+            return;
+        };
+        let adaptive_answer_formats = AppSettings::global(cx)
+            .settings
+            .review
+            .adaptive_answer_formats;
+        if self.prefetched.as_ref().is_some_and(|prepared| {
+            prepared.prompt.unit_id == item.unit_id
+                && prepared.adaptive_answer_formats == adaptive_answer_formats
+        }) {
+            let prepared = self.prefetched.take().expect("已检查预生成题目");
+            self.prompt = Some(prepared.prompt);
+            self.generation_notice = prepared.notice;
+            self.phase = Phase::Answering;
+            self.prefetch_next(cx);
+            cx.notify();
+            return;
+        }
+        if self
+            .prefetched
+            .as_ref()
+            .is_some_and(|prepared| prepared.prompt.unit_id == item.unit_id)
+        {
+            self.prefetched = None;
+        }
+        if self.prefetching_unit_id == Some(item.unit_id) {
+            self.phase = Phase::Loading;
+            cx.notify();
+            return;
+        }
+        let pool = AppState::global(cx).pool.clone();
+        let ai = AppState::global(cx).ai.clone();
+        let revision = self.load_revision;
+        let unit_id = item.unit_id;
+        self.preparing_unit_id = Some(unit_id);
+        self.phase = Phase::Loading;
+        self.prompt = None;
+        self.selected_option = None;
+        self.show_source = false;
+        self.generation_notice = None;
+        cx.notify();
+        cx.spawn(
+            move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
+                let this = this.clone();
+                let mut cx = (*cx).clone();
+                async move {
+                    let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
+                        prepare_prompt(pool, ai, item, adaptive_answer_formats).await
+                    })
+                    .await;
+                    match result {
+                        Ok(prepared) => {
+                            this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision
+                                    || this.preparing_unit_id != Some(prepared.prompt.unit_id)
+                                {
+                                    return;
+                                }
+                                this.preparing_unit_id = None;
+                                let current_setting = AppSettings::global(cx)
+                                    .settings
+                                    .review
+                                    .adaptive_answer_formats;
+                                if prepared.adaptive_answer_formats != current_setting {
+                                    this.prepare_current(cx);
+                                    return;
+                                }
+                                if this.current.as_ref().map(|item| item.unit_id)
+                                    == Some(prepared.prompt.unit_id)
+                                {
+                                    this.prompt = Some(prepared.prompt);
+                                    this.generation_notice = prepared.notice;
+                                    this.phase = Phase::Answering;
+                                    this.prefetch_next(cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }
+                        Err(error) => {
+                            this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision
+                                    || this.preparing_unit_id != Some(unit_id)
+                                {
+                                    return;
+                                }
+                                this.preparing_unit_id = None;
+                                this.error = Some(format!("准备动态题目失败: {error}"));
+                                this.phase = Phase::Finished;
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn prefetch_next(&mut self, cx: &mut Context<Self>) {
+        if self.prefetched.is_some() || self.prefetching_unit_id.is_some() {
+            return;
+        }
+        let Some(item) = self.queue.get(1).cloned() else {
+            return;
+        };
+        let pool = AppState::global(cx).pool.clone();
+        let ai = AppState::global(cx).ai.clone();
+        let adaptive_answer_formats = AppSettings::global(cx)
+            .settings
+            .review
+            .adaptive_answer_formats;
+        let revision = self.load_revision;
+        let unit_id = item.unit_id;
+        self.prefetching_unit_id = Some(unit_id);
+        cx.spawn(
+            move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
+                let this = this.clone();
+                let mut cx = (*cx).clone();
+                async move {
+                    let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
+                        prepare_prompt(pool, ai, item, adaptive_answer_formats).await
+                    })
+                    .await;
+                    match result {
+                        Ok(prepared) => {
+                            this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision
+                                    || this.prefetching_unit_id != Some(unit_id)
+                                {
+                                    return;
+                                }
+                                this.prefetching_unit_id = None;
+                                let current_setting = AppSettings::global(cx)
+                                    .settings
+                                    .review
+                                    .adaptive_answer_formats;
+                                if prepared.adaptive_answer_formats != current_setting {
+                                    if this.current.as_ref().map(|item| item.unit_id)
+                                        == Some(unit_id)
+                                        && this.prompt.is_none()
+                                    {
+                                        this.prepare_current(cx);
+                                    } else if this.queue.get(1).map(|item| item.unit_id)
+                                        == Some(unit_id)
+                                    {
+                                        this.prefetch_next(cx);
+                                    }
+                                    return;
+                                }
+                                if this.current.as_ref().map(|item| item.unit_id) == Some(unit_id)
+                                    && this.prompt.is_none()
+                                {
+                                    this.prompt = Some(prepared.prompt);
+                                    this.generation_notice = prepared.notice;
+                                    this.phase = Phase::Answering;
+                                    this.prefetch_next(cx);
+                                    cx.notify();
+                                } else if this.queue.get(1).map(|item| item.unit_id)
+                                    == Some(unit_id)
+                                {
+                                    this.prefetched = Some(prepared);
+                                }
+                            })
+                            .ok();
+                        }
+                        Err(error) => {
+                            crate::diagnostics::warn(
+                                "review.question.prefetch_failed",
+                                "Next dynamic question could not be prefetched",
+                                serde_json::json!({
+                                    "unit_id": unit_id,
+                                    "error": format!("{error:#}"),
+                                }),
+                            );
+                            this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision
+                                    || this.prefetching_unit_id != Some(unit_id)
+                                {
+                                    return;
+                                }
+                                this.prefetching_unit_id = None;
+                                if this.current.as_ref().map(|item| item.unit_id) == Some(unit_id)
+                                    && this.prompt.is_none()
+                                {
+                                    this.prepare_current(cx);
+                                }
+                            })
+                            .ok();
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 用户点击「开始复习」后，才为当前知识单元生成动态题面。
+    fn start(&mut self, cx: &mut Context<Self>) {
+        if self.current.is_some() {
+            self.prepare_current(cx);
+        }
     }
 
     fn select_group(&mut self, group_id: Option<i64>, cx: &mut Context<Self>) {
@@ -164,8 +413,19 @@ impl ReviewView {
         self.load(cx);
     }
 
+    fn select_option(&mut self, option: String, cx: &mut Context<Self>) {
+        if matches!(self.phase, Phase::Answering) {
+            self.selected_option = Some(option);
+            self.error = None;
+            cx.notify();
+        }
+    }
+
     fn submit(&mut self, cx: &mut Context<Self>) {
-        let Some(card) = self.current.clone() else {
+        let Some(item) = self.current.clone() else {
+            return;
+        };
+        let Some(prompt) = self.prompt.clone() else {
             return;
         };
         let Some(ai) = AppState::global(cx).ai.clone() else {
@@ -173,22 +433,26 @@ impl ReviewView {
             cx.notify();
             return;
         };
-        let user_answer = self.answer.read(cx).value().to_string();
+        let user_answer = if prompt.format == QuestionFormat::Choice {
+            self.selected_option.clone().unwrap_or_default()
+        } else {
+            self.answer.read(cx).value().to_string()
+        };
         if user_answer.trim().is_empty() {
-            self.error = Some("答案不能为空".into());
+            self.error = Some(if prompt.format == QuestionFormat::Choice {
+                "请先选择一个答案".into()
+            } else {
+                "答案不能为空".into()
+            });
             cx.notify();
             return;
         }
         self.phase = Phase::Judging;
         self.error = None;
-        cx.notify();
-        let (question, standard_answer, required_points) = (
-            card.question.clone(),
-            card.standard_answer.clone(),
-            card.required_points.clone(),
-        );
         self.submitted_answer = user_answer.clone();
-        let submitted = user_answer;
+        let revision = self.load_revision;
+        let unit_id = item.unit_id;
+        cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
@@ -197,10 +461,10 @@ impl ReviewView {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
                         crate::ai::judge::judge(
                             &ai,
-                            &question,
-                            &standard_answer,
-                            &required_points,
-                            &submitted,
+                            &prompt.question,
+                            &prompt.standard_answer,
+                            &prompt.required_points,
+                            &user_answer,
                         )
                         .await
                     })
@@ -208,33 +472,42 @@ impl ReviewView {
                     match result {
                         Ok(judgement) => {
                             this.update(&mut cx, |this, cx| {
-                                let days = card.days_elapsed(Utc::now());
+                                if this.load_revision != revision
+                                    || this.current.as_ref().map(|item| item.unit_id)
+                                        != Some(unit_id)
+                                {
+                                    return;
+                                }
                                 let next = AppState::global(cx)
                                     .scheduler
-                                    .next_states(card.memory, days);
+                                    .next_states(item.memory, item.days_elapsed(Utc::now()));
                                 match next {
-                                    Ok(next) => {
-                                        this.phase = Phase::Judged { judgement, next };
-                                    }
-                                    Err(e) => {
+                                    Ok(next) => this.phase = Phase::Judged { judgement, next },
+                                    Err(error) => {
                                         this.phase = Phase::Answering;
-                                        this.error = Some(format!("FSRS 计算失败: {e}"));
+                                        this.error = Some(format!("FSRS 计算失败: {error}"));
                                     }
                                 }
                                 cx.notify();
                             })
                             .ok();
                         }
-                        Err(e) => {
+                        Err(error) => {
                             crate::diagnostics::error(
                                 "review.judge.failed",
                                 "AI judgement failed",
-                                serde_json::json!({ "error": format!("{e:#}") }),
+                                serde_json::json!({ "error": format!("{error:#}") }),
                             );
                             this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision
+                                    || this.current.as_ref().map(|item| item.unit_id)
+                                        != Some(unit_id)
+                                {
+                                    return;
+                                }
                                 this.phase = Phase::Answering;
                                 this.error = Some(format!(
-                                    "判官调用失败: {e}\n{}",
+                                    "判官调用失败: {error}\n{}",
                                     crate::diagnostics::log_hint()
                                 ));
                                 cx.notify();
@@ -249,7 +522,10 @@ impl ReviewView {
     }
 
     fn rate(&mut self, rating: Rating, cx: &mut Context<Self>) {
-        let Some(card) = self.current.clone() else {
+        let Some(item) = self.current.clone() else {
+            return;
+        };
+        let Some(prompt) = self.prompt.clone() else {
             return;
         };
         let (judgement, next) = match &self.phase {
@@ -258,11 +534,11 @@ impl ReviewView {
         };
         let state = Scheduler::state_for(rating, &next);
         let due = Scheduler::due_date(state);
-        let reps = card.reps + 1;
+        let reps = item.reps + 1;
         let lapses = if rating == Rating::Again {
-            card.lapses + 1
+            item.lapses + 1
         } else {
-            card.lapses
+            item.lapses
         };
         let memory = state.memory;
         let pool = AppState::global(cx).pool.clone();
@@ -272,6 +548,8 @@ impl ReviewView {
         let retry_next = next.clone();
         let answer_input = self.answer.clone();
         let window_handle = self.window;
+        let completed_unit_id = item.unit_id;
+        let revision = self.load_revision;
         self.phase = Phase::Scheduling;
         self.error = None;
         cx.notify();
@@ -281,41 +559,58 @@ impl ReviewView {
                 let mut cx = (*cx).clone();
                 async move {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
-                        db::cards::update_schedule(&pool, card.id, memory, due, reps, lapses)
-                            .await?;
-                        db::reviews::insert(&pool, card.id, &user_answer, &feedback, rating)
-                            .await?;
-                        Ok(())
+                        db::dynamic_reviews::complete_review(
+                            &pool,
+                            &item,
+                            prompt.id,
+                            &user_answer,
+                            &feedback,
+                            rating,
+                            memory,
+                            due,
+                            reps,
+                            lapses,
+                        )
+                        .await
                     })
                     .await;
                     match result {
                         Ok(()) => {
-                            // 清空答案输入框
                             cx.update_window(window_handle, move |_view, window, cx| {
-                                answer_input.update(cx, |s, cx| s.set_value("", window, cx));
+                                answer_input
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
                             })
                             .ok();
                             this.update(&mut cx, |this, cx| {
-                                this.queue.retain(|c| c.id != card.id);
+                                if this.load_revision != revision {
+                                    return;
+                                }
+                                this.queue
+                                    .retain(|queued| queued.unit_id != completed_unit_id);
                                 this.current = this.queue.first().cloned();
+                                this.prompt = None;
+                                this.selected_option = None;
                                 this.show_source = false;
                                 this.submitted_answer.clear();
-                                this.phase = if this.current.is_some() {
-                                    Phase::Answering
+                                if this.current.is_some() {
+                                    this.prepare_current(cx);
                                 } else {
-                                    Phase::Finished
-                                };
-                                cx.notify();
+                                    this.phase = Phase::Finished;
+                                    cx.notify();
+                                }
                             })
                             .ok();
                         }
-                        Err(e) => {
+                        Err(error) => {
                             this.update(&mut cx, |this, cx| {
+                                if this.load_revision != revision {
+                                    return;
+                                }
                                 this.phase = Phase::Judged {
                                     judgement: retry_judgement,
                                     next: retry_next,
                                 };
-                                this.error = Some(format!("保存复习记录失败: {e}"));
+                                this.error = Some(format!("保存复习记录失败: {error}"));
                                 cx.notify();
                             })
                             .ok();
@@ -329,34 +624,28 @@ impl ReviewView {
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let success_color = cx.theme().green;
         let warning_color = cx.theme().yellow;
         let error_color = cx.theme().red;
         let compact = window.viewport_size().width.as_f32() < 900.;
-
-        let error = self.error.clone().map(|e| {
-            Alert::error("review-alert", e)
-                .banner()
-                .on_close(cx.listener(|this, _, _, cx| {
-                    this.error = None;
-                    cx.notify();
-                }))
-                .into_any_element()
-        });
+        let busy = matches!(
+            self.phase,
+            Phase::Loading | Phase::Judging | Phase::Scheduling
+        );
 
         let header = page_header(
             RuizIcon::BrainCircuit,
             "复习",
-            "专注回忆，再让 AI 给出反馈，最后交给 FSRS 安排下一次复习。",
+            "每次根据知识单元和熟练度生成新题，再由 FSRS 安排下一次复习。",
             Some(
                 Button::new("btn-reload-header")
                     .icon(IconName::Redo2)
                     .label("刷新队列")
                     .outline()
                     .loading(matches!(self.phase, Phase::Loading))
-                    .disabled(matches!(self.phase, Phase::Loading))
+                    .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
                     .into_any_element(),
             ),
@@ -386,6 +675,7 @@ impl Render for ReviewView {
                         Button::new("review-all-groups")
                             .small()
                             .outline()
+                            .disabled(busy)
                             .selected(self.selected_group_id.is_none())
                             .label("全部")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -397,13 +687,11 @@ impl Render for ReviewView {
                         Button::new(SharedString::from(format!("review-group-{group_id}")))
                             .small()
                             .outline()
+                            .disabled(busy)
                             .selected(self.selected_group_id == Some(group_id))
                             .label(format!(
-                                "{} · {} 章 · {} 张 · {} 到期",
-                                summary.group.name,
-                                summary.note_count,
-                                summary.card_count,
-                                summary.due_count
+                                "{} · {} 项 · {} 到期",
+                                summary.group.name, summary.card_count, summary.due_count
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_group(Some(group_id), cx);
@@ -411,7 +699,6 @@ impl Render for ReviewView {
                     })),
             )
             .when_some(self.selected_group_id, |this, group_id| {
-                let all_selected = self.selected_note_id.is_none();
                 this.child(
                     h_flex()
                         .items_center()
@@ -428,7 +715,8 @@ impl Render for ReviewView {
                             Button::new("review-all-chapters")
                                 .small()
                                 .outline()
-                                .selected(all_selected)
+                                .disabled(busy)
+                                .selected(self.selected_note_id.is_none())
                                 .label("全部章节")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.select_note(None, cx);
@@ -445,6 +733,7 @@ impl Render for ReviewView {
                                     )))
                                     .small()
                                     .outline()
+                                    .disabled(busy)
                                     .selected(self.selected_note_id == Some(note_id))
                                     .label(note.title.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -455,101 +744,56 @@ impl Render for ReviewView {
                 )
             });
 
-        let body: gpui::AnyElement = match &self.phase {
-            Phase::Loading => v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .p_6()
-                .child(
-                    GroupBox::new()
-                        .outline()
-                        .w_full()
-                        .max_w(px(680.))
-                        .title(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(Spinner::new().small())
-                                .child("正在准备复习队列"),
-                        )
-                        .child(Skeleton::new().w_2_3())
-                        .child(Skeleton::new().secondary().w_full())
-                        .child(Skeleton::new().secondary().w_4_5()),
+        let body = match &self.phase {
+            Phase::Loading => loading_state(colors).into_any_element(),
+            Phase::Ready => empty_state(
+                IconName::Play,
+                "准备好开始复习了吗？",
+                format!(
+                    "当前范围有 {} 个到期知识单元，点击开始后逐题生成动态题目。",
+                    self.queue.len()
                 ),
-            Phase::Finished => v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .children(error)
-                .child(empty_state(
-                    IconName::CircleCheck,
-                    "今天的复习已经完成",
-                    "到期卡片都处理完了，可以稍后再回来，或刷新检查新的复习任务。",
-                    Some(
-                        Button::new("btn-reload")
-                            .icon(IconName::Redo2)
-                            .label("刷新队列")
-                            .primary()
-                            .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
-                            .into_any_element(),
-                    ),
-                    cx,
-                )),
-            Phase::Judging => v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .p_6()
-                .child(
-                    GroupBox::new()
-                        .fill()
-                        .w_full()
-                        .max_w(px(680.))
-                        .title(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(Spinner::new().small().color(colors.primary))
-                                .child("AI 正在评估答案"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(colors.muted_foreground)
-                                .child("正在对比问题、标准答案和你的作答，请稍候。"),
-                        )
-                        .child(Skeleton::new().w_full())
-                        .child(Skeleton::new().secondary().w_3_5()),
+                Some(
+                    Button::new("btn-start-review")
+                        .icon(IconName::Play)
+                        .label("开始复习")
+                        .primary()
+                        .on_click(cx.listener(|this, _, _, cx| this.start(cx)))
+                        .into_any_element(),
                 ),
-            Phase::Scheduling => v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .p_6()
-                .child(
-                    GroupBox::new()
-                        .outline()
-                        .w_full()
-                        .max_w(px(560.))
-                        .title(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(Spinner::new().small().color(colors.primary))
-                                .child("正在安排下次复习"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(colors.muted_foreground)
-                                .child("正在保存本次结果，并更新 FSRS 记忆状态。"),
-                        )
-                        .child(Skeleton::new().secondary().w_3_5()),
+                cx,
+            )
+            .into_any_element(),
+            Phase::Finished => empty_state(
+                IconName::CircleCheck,
+                "当前范围的复习已经完成",
+                "到期知识单元都处理完了，可以稍后回来或刷新队列。",
+                Some(
+                    Button::new("btn-reload")
+                        .icon(IconName::Redo2)
+                        .label("刷新队列")
+                        .primary()
+                        .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
+                        .into_any_element(),
                 ),
+                cx,
+            )
+            .into_any_element(),
+            Phase::Judging => process_state(
+                "AI 正在评估答案",
+                "正在对比本次动态题面、稳定必答点和你的作答。",
+                colors,
+            )
+            .into_any_element(),
+            Phase::Scheduling => process_state(
+                "正在安排下次复习",
+                "正在保存题面快照、作答记录和知识单元的 FSRS 状态。",
+                colors,
+            )
+            .into_any_element(),
             Phase::Answering | Phase::Judged { .. } => {
-                let card = self.current.clone().expect("作答阶段必有当前卡片");
-
+                let item = self.current.clone().expect("作答阶段必有知识单元");
+                let prompt = self.prompt.clone().expect("作答阶段必有动态题面");
                 let is_judged = matches!(self.phase, Phase::Judged { .. });
                 let question = GroupBox::new()
                     .outline()
@@ -565,33 +809,46 @@ impl Render for ReviewView {
                                     .items_center()
                                     .gap_2()
                                     .child(Icon::new(RuizIcon::BrainCircuit).size_4())
-                                    .child("问题"),
+                                    .child(format!("{} · {}", item.note_title, item.topic)),
                             )
                             .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(colors.muted)
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(format!("剩余 {} 张", self.queue.len())),
+                                h_flex()
+                                    .gap_2()
+                                    .flex_wrap()
+                                    .child(status_badge(
+                                        prompt.format.label(),
+                                        colors.primary,
+                                        colors,
+                                    ))
+                                    .child(status_badge(
+                                        prompt.mastery.label(),
+                                        success_color,
+                                        colors,
+                                    ))
+                                    .child(status_badge(
+                                        if prompt.generation_mode == "ai" {
+                                            "AI 变式"
+                                        } else {
+                                            "基础题"
+                                        },
+                                        colors.muted_foreground,
+                                        colors,
+                                    ))
+                                    .child(status_badge(
+                                        &format!("剩余 {} 项", self.queue.len()),
+                                        colors.muted_foreground,
+                                        colors,
+                                    )),
                             ),
                     )
                     .child(
                         div()
                             .text_lg()
                             .font_medium()
-                            .child(SharedString::from(card.question.clone())),
+                            .child(SharedString::from(prompt.question.clone())),
                     );
 
-                // 原文（可折叠）
-                let source = if self.show_source {
-                    let excerpt = card
-                        .source_excerpt
-                        .clone()
-                        .unwrap_or_else(|| "（本题没有原文引用）".into());
-                    let standard = card.standard_answer.clone();
+                let source = self.show_source.then(|| {
                     GroupBox::new()
                         .fill()
                         .title(
@@ -604,31 +861,125 @@ impl Render for ReviewView {
                         .child(
                             v_flex()
                                 .gap_1()
-                                .child(div().text_sm().font_medium().child("原文片段"))
+                                .child(div().text_sm().font_medium().child("原文证据"))
                                 .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(colors.muted_foreground)
-                                        .child(SharedString::from(excerpt)),
+                                    div().text_sm().text_color(colors.muted_foreground).child(
+                                        SharedString::from(
+                                            prompt
+                                                .source_excerpt
+                                                .clone()
+                                                .unwrap_or_else(|| "（没有原文引用）".into()),
+                                        ),
+                                    ),
                                 ),
                         )
                         .child(
                             v_flex()
                                 .gap_1()
-                                .child(div().text_sm().font_medium().child("标准答案"))
+                                .child(div().text_sm().font_medium().child("本题标准答案"))
                                 .child(
                                     div()
                                         .text_sm()
                                         .text_color(colors.muted_foreground)
-                                        .child(SharedString::from(standard)),
+                                        .child(SharedString::from(prompt.standard_answer.clone())),
                                 ),
                         )
+                });
+
+                let response_control = if prompt.format == QuestionFormat::Choice {
+                    v_flex()
+                        .gap_2()
+                        .children(prompt.options.iter().enumerate().map(|(index, option)| {
+                            let option_value = option.clone();
+                            Button::new(SharedString::from(format!("choice-option-{index}")))
+                                .w_full()
+                                .h_auto()
+                                .min_h_8()
+                                .py_2()
+                                .outline()
+                                .selected(self.selected_option.as_ref() == Some(option))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .items_start()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .font_medium()
+                                                .child(format!("{}.", index + 1)),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .whitespace_normal()
+                                                .text_left()
+                                                .child(option.clone()),
+                                        ),
+                                )
+                                .disabled(is_judged)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_option(option_value.clone(), cx);
+                                }))
+                        }))
                         .into_any_element()
                 } else {
-                    div().into_any_element()
+                    Input::new(&self.answer).h(px(180.)).into_any_element()
                 };
 
-                // 判官结果区
+                let answer_area = GroupBox::new()
+                    .fill()
+                    .title(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::SquareTerminal).size_4())
+                            .child("你的回答"),
+                    )
+                    .child(response_control)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new("btn-show-source")
+                                    .icon(if self.show_source {
+                                        IconName::EyeOff
+                                    } else {
+                                        IconName::Eye
+                                    })
+                                    .label(if self.show_source {
+                                        "隐藏参考材料"
+                                    } else {
+                                        "显示参考材料"
+                                    })
+                                    .outline()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_source = !this.show_source;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("btn-submit")
+                                    .icon(IconName::Check)
+                                    .label(if is_judged {
+                                        "已完成判分"
+                                    } else {
+                                        "提交判分"
+                                    })
+                                    .primary()
+                                    .disabled(
+                                        is_judged
+                                            || (prompt.format == QuestionFormat::Choice
+                                                && self.selected_option.is_none()),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                            ),
+                    );
+
                 let judge_area = if let Phase::Judged { judgement, next } = &self.phase {
                     Some(
                         GroupBox::new()
@@ -647,17 +998,11 @@ impl Render for ReviewView {
                                             .child(Icon::new(RuizIcon::Sparkles).size_4())
                                             .child("AI 反馈"),
                                     )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_full()
-                                            .bg(colors.primary.opacity(0.12))
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(colors.primary)
-                                            .child(format!("{}/100", judgement.score)),
-                                    ),
+                                    .child(status_badge(
+                                        &format!("{}/100", judgement.score),
+                                        colors.primary,
+                                        colors,
+                                    )),
                             )
                             .child(
                                 v_flex()
@@ -679,7 +1024,7 @@ impl Render for ReviewView {
                                         .gap_2()
                                         .child(div().text_sm().font_medium().child("必答点检查"))
                                         .children(judgement.point_results.iter().map(|result| {
-                                            let point = card
+                                            let point = prompt
                                                 .required_points
                                                 .get(result.point_index)
                                                 .cloned()
@@ -709,9 +1054,7 @@ impl Render for ReviewView {
                                                             h_flex()
                                                                 .gap_2()
                                                                 .flex_wrap()
-                                                                .child(div().text_sm().child(
-                                                                    SharedString::from(point),
-                                                                ))
+                                                                .child(div().text_sm().child(point))
                                                                 .child(
                                                                     div()
                                                                         .text_xs()
@@ -766,54 +1109,6 @@ impl Render for ReviewView {
                     None
                 };
 
-                // 作答区
-                let answer_area = GroupBox::new()
-                    .fill()
-                    .title(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Icon::new(IconName::SquareTerminal).size_4())
-                            .child("你的回答"),
-                    )
-                    .child(Input::new(&self.answer).h(px(180.)))
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(
-                                Button::new("btn-show-source")
-                                    .icon(if self.show_source {
-                                        IconName::EyeOff
-                                    } else {
-                                        IconName::Eye
-                                    })
-                                    .label(if self.show_source {
-                                        "隐藏参考材料"
-                                    } else {
-                                        "显示参考材料"
-                                    })
-                                    .outline()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_source = !this.show_source;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("btn-submit")
-                                    .icon(IconName::Check)
-                                    .label(if is_judged {
-                                        "已完成判分"
-                                    } else {
-                                        "提交判分"
-                                    })
-                                    .primary()
-                                    .disabled(is_judged)
-                                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
-                            ),
-                    );
-
                 v_flex()
                     .w_full()
                     .max_w(px(880.))
@@ -834,32 +1129,172 @@ impl Render for ReviewView {
                             .child(step_badge("3", "选择排期", is_judged, colors)),
                     )
                     .child(question)
-                    .child(source)
-                    .children(error)
+                    .children(source)
                     .child(answer_area)
                     .children(judge_area)
+                    .into_any_element()
+            }
+        };
+
+        let error = self.error.clone().map(|message| {
+            Alert::error("review-alert", message)
+                .banner()
+                .on_close(cx.listener(|this, _, _, cx| {
+                    this.error = None;
+                    cx.notify();
+                }))
+        });
+        let notice = self.generation_notice.clone().map(|message| {
+            Alert::warning("generation-notice", message)
+                .banner()
+                .on_close(cx.listener(|this, _, _, cx| {
+                    this.generation_notice = None;
+                    cx.notify();
+                }))
+        });
+
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(scope_bar)
+            .children(error)
+            .children(notice)
+            .child(
+                div()
+                    .id("review-scroll-wrap")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("review-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .child(body),
+                    )
+                    .vertical_scrollbar(&self.scroll),
+            )
+    }
+}
+
+async fn prepare_prompt(
+    pool: sqlx::SqlitePool,
+    ai: Option<ChatClient>,
+    item: ReviewItem,
+    adaptive_answer_formats: bool,
+) -> anyhow::Result<PreparedPrompt> {
+    let recent = db::dynamic_reviews::recent_questions(&pool, item.unit_id, 5).await?;
+    let format = item.question_format(adaptive_answer_formats);
+    let (mut prompt, notice) = match ai {
+        Some(ai) => {
+            match crate::ai::dynamic_question::generate(&ai, &item, format, &recent).await {
+                Ok(prompt) => (prompt, None),
+                Err(error) => {
+                    crate::diagnostics::warn(
+                        "review.question.fallback",
+                        "Dynamic question generation failed; using seed prompt",
+                        serde_json::json!({
+                            "unit_id": item.unit_id,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                    (
+                        item.fallback_prompt(),
+                        Some(format!("动态出题失败，已使用基础题: {error}")),
+                    )
+                }
             }
         }
-        .into_any_element();
+        None => (
+            item.fallback_prompt(),
+            Some("未配置 AI，当前使用基础题；提交判分前需要配置 AI".into()),
+        ),
+    };
+    let prompt_id = db::dynamic_reviews::insert_prompt(&pool, &prompt).await?;
+    prompt.id = Some(prompt_id);
+    Ok(PreparedPrompt {
+        prompt,
+        notice,
+        adaptive_answer_formats,
+    })
+}
 
-        v_flex().size_full().child(header).child(scope_bar).child(
-            div()
-                .id("review-scroll-wrap")
-                .relative()
-                .flex_1()
-                .min_h_0()
+fn loading_state(colors: ThemeColor) -> impl IntoElement {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .p_6()
+        .child(
+            GroupBox::new()
+                .outline()
                 .w_full()
+                .max_w(px(680.))
+                .title(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Spinner::new().small().color(colors.primary))
+                        .child("正在准备动态题目"),
+                )
                 .child(
                     div()
-                        .id("review-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .child(body),
+                        .text_sm()
+                        .text_color(colors.muted_foreground)
+                        .child("正在读取知识证据、熟练度和最近题目，生成本次复习题面。"),
                 )
-                .vertical_scrollbar(&self.scroll),
+                .child(Skeleton::new().w_full())
+                .child(Skeleton::new().secondary().w_3_5()),
         )
-    }
+}
+
+fn process_state(
+    title: &'static str,
+    description: &'static str,
+    colors: ThemeColor,
+) -> impl IntoElement {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .p_6()
+        .child(
+            GroupBox::new()
+                .outline()
+                .w_full()
+                .max_w(px(680.))
+                .title(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Spinner::new().small().color(colors.primary))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(colors.muted_foreground)
+                        .child(description),
+                )
+                .child(Skeleton::new().secondary().w_3_5()),
+        )
+}
+
+fn status_badge(label: &str, color: gpui::Hsla, colors: ThemeColor) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded_full()
+        .bg(if color == colors.muted_foreground {
+            colors.muted
+        } else {
+            color.opacity(0.12)
+        })
+        .text_xs()
+        .text_color(color)
+        .child(label.to_string())
 }
 
 fn step_badge(

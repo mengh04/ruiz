@@ -16,11 +16,11 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<StudyGroup>> {
 pub async fn summaries(pool: &SqlitePool, now: DateTime<Utc>) -> Result<Vec<GroupSummary>> {
     let rows = sqlx::query(
         "SELECT g.*, COUNT(DISTINCT n.id) AS note_count,
-                COUNT(DISTINCT c.id) AS card_count,
-                COUNT(DISTINCT CASE WHEN c.due <= ?1 THEN c.id END) AS due_count
+                COUNT(DISTINCT ku.id) AS card_count,
+                COUNT(DISTINCT CASE WHEN ku.due <= ?1 THEN ku.id END) AS due_count
          FROM study_groups g
          LEFT JOIN notes n ON n.group_id = g.id
-         LEFT JOIN cards c ON c.note_id = n.id
+         LEFT JOIN knowledge_units ku ON ku.note_id = n.id AND ku.generated = 1
          GROUP BY g.id ORDER BY g.name COLLATE NOCASE",
     )
     .bind(now.to_rfc3339())

@@ -1,9 +1,11 @@
 use gpui::{Context, IntoElement, Render, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme as _, Icon,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _,
     group_box::GroupBoxVariant,
     h_flex,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    switch::Switch,
+    tag::{Tag, TagVariant},
     v_flex,
 };
 
@@ -18,6 +20,71 @@ pub struct SettingsView;
 impl SettingsView {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self
+    }
+
+    fn review_page() -> SettingPage {
+        SettingPage::new("复习")
+            .icon(Icon::new(RuizIcon::BrainCircuit))
+            .description("控制动态复习题型和作答方式。")
+            .resettable(false)
+            .group(
+                SettingGroup::new()
+                    .title("实验性功能")
+                    .description("Beta 功能可能仍在调整中，关闭后会回到稳定的简答题流程。")
+                    .item(
+                        SettingItem::render(|options, _window, cx| {
+                            let enabled = AppSettings::global(cx)
+                                .settings
+                                .review
+                                .adaptive_answer_formats;
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_start()
+                                .gap_3()
+                                .when(options.disabled, |this| this.opacity(0.5))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .gap_1()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .flex_wrap()
+                                                .child(div().text_sm().child("根据熟练度选择作答方式"))
+                                                .child(
+                                                    Tag::new()
+                                                        .with_variant(TagVariant::Warning)
+                                                        .small()
+                                                        .child("Beta"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().colors.muted_foreground)
+                                                .child("开启后会根据熟练度在选择题、填空题、简答题和应用题之间切换。"),
+                                        ),
+                                )
+                                .child(
+                                    Switch::new("adaptive-answer-formats")
+                                        .checked(enabled)
+                                        .disabled(options.disabled)
+                                        .on_click(|checked, window, cx| {
+                                            AppSettings::global_mut(cx)
+                                                .settings
+                                                .review
+                                                .adaptive_answer_formats = *checked;
+                                            save_settings(cx);
+                                            window.refresh();
+                                        }),
+                                )
+                        })
+                        .keywords(["review", "adaptive", "mastery", "熟练度", "题型", "beta"]),
+                    ),
+            )
     }
 
     fn ai_page() -> SettingPage {
@@ -156,7 +223,7 @@ impl Render for SettingsView {
                     .sidebar_width(px(216.))
                     .sidebar_size_range(px(184.)..px(300.))
                     .with_group_variant(GroupBoxVariant::Outline)
-                    .pages([Self::ai_page(), Self::about_page()]),
+                    .pages([Self::ai_page(), Self::review_page(), Self::about_page()]),
             ),
         )
     }
@@ -169,6 +236,13 @@ fn optional_value(value: &str) -> Option<String> {
 
 /// 将配置写入磁盘，并刷新运行时 AI 客户端。
 fn refresh_ai(cx: &mut gpui::App) {
+    save_settings(cx);
+    let config = AppSettings::global(cx).settings.clone();
+    AppState::global_mut(cx).configure_ai(&config);
+}
+
+/// 将当前配置写入磁盘。
+fn save_settings(cx: &mut gpui::App) {
     let config = AppSettings::global(cx).settings.clone();
     if let Err(error) = save_config(&config) {
         crate::diagnostics::error(
@@ -178,5 +252,4 @@ fn refresh_ai(cx: &mut gpui::App) {
         );
         eprintln!("保存设置失败: {error}");
     }
-    AppState::global_mut(cx).configure_ai(&config);
 }

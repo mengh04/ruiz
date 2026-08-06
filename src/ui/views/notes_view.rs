@@ -1,4 +1,4 @@
-//! 笔记视图：导入学习材料、AI 出题、浏览卡片。
+//! 笔记视图：导入学习材料、建立知识蓝图、管理动态复习的基础题。
 
 use gpui::{
     AnyWindowHandle, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Window, div,
@@ -292,7 +292,7 @@ impl NotesView {
                                 if this.page.note_id() == Some(note_id) {
                                     this.cards_loading = false;
                                     this.message =
-                                        Some(Message::Error(format!("加载卡片失败: {e}")));
+                                        Some(Message::Error(format!("加载基础题失败: {e}")));
                                 }
                                 cx.notify();
                             })
@@ -396,7 +396,7 @@ impl NotesView {
                                 content_input.update(cx, |s, cx| s.set_value("", window, cx));
                                 window.push_notification(
                                     format!(
-                                        "已导入 {material_count} 篇材料，生成 {question_count} 张推荐卡片"
+                                        "已导入 {material_count} 篇材料，生成 {question_count} 道基础题"
                                     ),
                                     cx,
                                 );
@@ -409,7 +409,7 @@ impl NotesView {
                                     .map(NotesPage::Detail)
                                     .unwrap_or(NotesPage::Library);
                                 this.message = Some(Message::Success(format!(
-                                    "AI 已整理出 {material_count} 篇材料，并生成 {question_count} 张推荐卡片"
+                                    "AI 已整理出 {material_count} 篇材料，并生成 {question_count} 道基础题"
                                 )));
                                 this.refresh_notes(cx);
                                 this.refresh_groups(cx);
@@ -535,7 +535,7 @@ impl NotesView {
                         .gap_3()
                         .child(
                             div().text_sm().child(
-                                "选择已有分组，或输入新名称后保存。卡片和复习进度不会改变。",
+                                "选择已有分组，或输入新名称后保存。基础题和复习进度不会改变。",
                             ),
                         )
                         .child(Select::new(&group_select).w_full())
@@ -837,7 +837,7 @@ impl NotesView {
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
-                                    "直接粘贴原始网页、课程笔记或多篇 Markdown。AI 会自动去除导航与广告，拆分材料，生成标题、知识蓝图和推荐卡片。",
+                                    "直接粘贴原始网页、课程笔记或多篇 Markdown。AI 会自动去除导航与广告，拆分材料，生成标题、知识蓝图和复习基础题。",
                                 ),
                         )
                         .child(
@@ -929,7 +929,7 @@ impl NotesView {
             dialog
                 .title("删除这篇笔记？")
                 .description(format!(
-                    "“{title}”以及它生成的学习卡片和复习记录都会被删除，此操作无法撤销。"
+                    "“{title}”以及它生成的基础题、动态题面和复习记录都会被删除，此操作无法撤销。"
                 ))
                 .button_props(
                     DialogButtonProps::default()
@@ -1034,7 +1034,7 @@ impl NotesView {
             .collect::<Vec<_>>();
         if has_analysis && remaining_units.is_empty() {
             self.message = Some(Message::Success(format!(
-                "{}范围的卡片已经全部生成",
+                "{}范围的基础题已经全部生成",
                 generation_scope.label()
             )));
             cx.notify();
@@ -1096,7 +1096,7 @@ impl NotesView {
                             this.update(&mut cx, |this, cx| {
                                 this.generating = false;
                                 this.message = Some(Message::Success(format!(
-                                    "知识蓝图已更新，并生成 {n} 道题"
+                                    "知识蓝图已更新，并生成 {n} 道基础题"
                                 )));
                                 this.refresh_cards(cx);
                                 cx.notify();
@@ -1151,7 +1151,7 @@ impl Render for NotesView {
             NotesPage::Library => page_header(
                 RuizIcon::NotebookText,
                 "资料库",
-                "集中管理学习材料，打开一篇笔记后再生成和浏览学习卡片。",
+                "集中管理学习材料，打开一篇笔记后可查看知识蓝图和复习基础题。",
                 Some(
                     h_flex()
                         .gap_2()
@@ -1204,7 +1204,7 @@ impl Render for NotesView {
                 page_header(
                     RuizIcon::NotebookText,
                     title,
-                    "查看整理后的正文、知识蓝图和 AI 推荐卡片。",
+                    "查看整理后的正文、知识蓝图和动态复习的基础题。",
                     Some(
                         Button::new("back-to-library")
                             .icon(IconName::ArrowLeft)
@@ -1520,12 +1520,15 @@ impl Render for NotesView {
                 } else if remaining_count == 0 {
                     format!("{}已生成", self.generation_scope.label())
                 } else {
-                    format!("生成{} {remaining_count} 张", self.generation_scope.label())
+                    format!(
+                        "生成{} {remaining_count} 道基础题",
+                        self.generation_scope.label()
+                    )
                 }
             } else if self.generating {
                 "分析中…".to_string()
             } else {
-                format!("建立蓝图并生成{}", self.generation_scope.label())
+                format!("建立蓝图并生成{}基础题", self.generation_scope.label())
             };
             let generate_bar = GroupBox::new()
                 .outline()
@@ -1588,7 +1591,7 @@ impl Render for NotesView {
                                 div()
                                     .text_sm()
                                     .text_color(colors.muted_foreground)
-                                    .child("导入旧笔记后，可以建立知识蓝图并生成学习卡片。"),
+                                    .child("导入旧笔记后，可以建立知识蓝图并生成复习基础题。"),
                             )
                         })
                         .when_some(self.analysis.as_ref(), |this, analysis| {
@@ -1639,8 +1642,8 @@ impl Render for NotesView {
             } else if cards.is_empty() {
                 empty_state(
                     IconName::Inbox,
-                    "还没有学习卡片",
-                    "用 AI 从这篇笔记生成一组问题，之后就可以在复习页练习。",
+                    "还没有基础题",
+                    "先为知识单元生成基础题；正常复习时 AI 会基于原始知识动态变换题型和问法。",
                     None,
                     cx,
                 )
@@ -1768,7 +1771,7 @@ impl Render for NotesView {
                                                 unit.topic,
                                                 unit.required_points.len(),
                                                 if unit.generated {
-                                                    "已生成卡片"
+                                                    "已生成基础题"
                                                 } else {
                                                     "等待生成"
                                                 }
@@ -1840,7 +1843,7 @@ impl Render for NotesView {
                                         .bg(colors.muted)
                                         .text_sm()
                                         .text_color(colors.muted_foreground)
-                                        .child(format!("{} 张卡片", cards.len())),
+                                        .child(format!("{} 道基础题", cards.len())),
                                 )
                                 .child(
                                     Button::new("change-note-group")
@@ -1904,7 +1907,7 @@ impl Render for NotesView {
                                 .items_center()
                                 .gap_2()
                                 .child(Icon::new(RuizIcon::NotebookText).size_4())
-                                .child(div().font_semibold().child("学习卡片")),
+                                .child(div().font_semibold().child("复习基础题")),
                         )
                         .child(card_list),
                 )

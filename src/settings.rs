@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use crate::ai::client::{DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL};
 
 #[derive(Debug, Default, Serialize, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub ai: AiConfig,
+    pub review: ReviewConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,14 @@ impl AiConfig {
             self.model = DEEPSEEK_FLASH_MODEL.into();
         }
     }
+}
+
+#[derive(Debug, Default, Serialize, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReviewConfig {
+    /// 启用后按知识单元熟练度生成选择、填空和应用题等动态题型。
+    /// 关闭时统一生成自由输入的简答题。
+    pub adaptive_answer_formats: bool,
 }
 
 pub fn load_config() -> Config {
@@ -101,6 +111,7 @@ mod tests {
         config.ai.normalize();
         assert_eq!(config.ai.api_key.as_deref(), Some("secret"));
         assert_eq!(config.ai.model, DEEPSEEK_FLASH_MODEL);
+        assert!(!config.review.adaptive_answer_formats);
         assert!(serde_json::to_value(config).unwrap()["ai"]["api_base"].is_null());
     }
 }

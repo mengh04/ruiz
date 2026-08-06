@@ -49,7 +49,7 @@ pub async fn save_import(
     })
 }
 
-/// 为旧版笔记补建知识蓝图并生成 AI 推荐卡片。
+/// 为旧版笔记补建知识蓝图并生成复习基础题。
 pub async fn save_plan_for_note(
     pool: &SqlitePool,
     note_id: i64,
@@ -123,9 +123,10 @@ async fn insert_prepared_data(
             "INSERT INTO knowledge_units
                 (note_id, local_id, topic, objective, unit_type, importance, stage,
                  cognitive_action, required_points_json, claim_ids_json, evidence_json,
-                 reason, quick, recommended, generated, prerequisite_ids_json, position)
+                 reason, quick, recommended, generated, stability, difficulty, due,
+                 reps, lapses, last_review, prerequisite_ids_json, position)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, 0, ?15, ?16)
+                     ?13, ?14, 0, NULL, NULL, ?15, 0, 0, NULL, ?16, ?17)
              RETURNING id",
         )
         .bind(note_id)
@@ -142,6 +143,7 @@ async fn insert_prepared_data(
         .bind(&unit.reason)
         .bind(i64::from(unit.quick))
         .bind(i64::from(unit.recommended))
+        .bind(now)
         .bind(serde_json::to_string(&unit.prerequisite_unit_ids)?)
         .bind(position as i64)
         .fetch_one(&mut **transaction)
@@ -237,8 +239,9 @@ async fn insert_question(
         .bind(unit_id)
         .execute(&mut **transaction)
         .await?;
-    sqlx::query("UPDATE knowledge_units SET generated = 1 WHERE id = ?1")
+    sqlx::query("UPDATE knowledge_units SET generated = 1, due = COALESCE(due, ?2) WHERE id = ?1")
         .bind(unit_id)
+        .bind(now)
         .execute(&mut **transaction)
         .await?;
     Ok(())

@@ -8,6 +8,7 @@ use crate::domain::card::Card;
 #[allow(dead_code)] // 旧版手动建卡 API 与数据库回归测试仍会使用
 pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
     let now = Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
     let row = sqlx::query(
         "INSERT INTO cards
             (note_id, question, standard_answer, source_excerpt,
@@ -21,9 +22,43 @@ pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
     .bind(&card.source_excerpt)
     .bind(card.due.to_rfc3339())
     .bind(&now)
-    .fetch_one(pool)
+    .fetch_one(&mut *transaction)
     .await?;
-    Ok(row.get("id"))
+    let card_id: i64 = row.get("id");
+    let evidence = serde_json::to_string(&vec![
+        card.source_excerpt
+            .clone()
+            .unwrap_or_else(|| card.standard_answer.clone()),
+    ])?;
+    let required_points = serde_json::to_string(&vec![card.standard_answer.clone()])?;
+    let unit_id: i64 = sqlx::query(
+        "INSERT INTO knowledge_units
+            (note_id, local_id, topic, objective, unit_type, importance, stage,
+             cognitive_action, required_points_json, claim_ids_json, evidence_json,
+             reason, quick, recommended, generated, stability, difficulty, due,
+             reps, lapses, last_review, prerequisite_ids_json, position)
+         VALUES (?1, ?2, '旧版卡片', ?3, 'legacy', 'core', 'foundation',
+                 'recall', ?4, '[]', ?5, '由旧版卡片迁移', 1, 1, 1,
+                 NULL, NULL, ?6, 0, 0, NULL, '[]', ?7)
+         RETURNING id",
+    )
+    .bind(card.note_id)
+    .bind(format!("legacy-card-{card_id}"))
+    .bind(&card.question)
+    .bind(required_points)
+    .bind(evidence)
+    .bind(card.due.to_rfc3339())
+    .bind(card_id)
+    .fetch_one(&mut *transaction)
+    .await?
+    .get("id");
+    sqlx::query("INSERT INTO card_knowledge_units (card_id, knowledge_unit_id) VALUES (?1, ?2)")
+        .bind(card_id)
+        .bind(unit_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(card_id)
 }
 
 pub async fn by_note(pool: &SqlitePool, note_id: i64) -> Result<Vec<Card>> {

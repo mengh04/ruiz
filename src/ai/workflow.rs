@@ -19,7 +19,7 @@ pub struct PreparedMaterial {
     pub questions: Vec<Question>,
 }
 
-/// 完整的一键导入工作流：去噪拆文档、建立知识蓝图、生成 AI 推荐卡片。
+/// 完整的一键导入工作流：去噪拆文档、建立知识蓝图、生成复习基础题。
 pub async fn prepare_import_with_progress(
     client: &ChatClient,
     raw: &str,

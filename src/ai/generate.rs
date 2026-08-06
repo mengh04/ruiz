@@ -45,7 +45,7 @@ pub async fn generate_questions_with_progress(
     progress(ImportProgress::stage(
         ImportStage::Generating,
         format!(
-            "正在一次性为《{material_title}》生成全部 {} 张推荐卡片",
+            "正在一次性为《{material_title}》生成全部 {} 道复习基础题",
             units.len()
         ),
     ));

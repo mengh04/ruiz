@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS knowledge_units (
     quick                  INTEGER NOT NULL DEFAULT 0,
     recommended            INTEGER NOT NULL DEFAULT 0,
     generated              INTEGER NOT NULL DEFAULT 0,
+    stability              REAL,
+    difficulty             REAL,
+    due                    TEXT NOT NULL,
+    reps                   INTEGER NOT NULL DEFAULT 0,
+    lapses                 INTEGER NOT NULL DEFAULT 0,
+    last_review            TEXT,
     prerequisite_ids_json  TEXT NOT NULL DEFAULT '[]',
     position               INTEGER NOT NULL,
     UNIQUE(note_id, local_id)
@@ -91,6 +97,35 @@ CREATE TABLE IF NOT EXISTS card_knowledge_units (
     knowledge_unit_id  INTEGER NOT NULL REFERENCES knowledge_units(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_card_units_unit ON card_knowledge_units(knowledge_unit_id);
+
+CREATE TABLE IF NOT EXISTS review_prompts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    knowledge_unit_id    INTEGER NOT NULL REFERENCES knowledge_units(id) ON DELETE CASCADE,
+    question_type        TEXT NOT NULL,
+    mastery_band         TEXT NOT NULL,
+    question             TEXT NOT NULL,
+    options_json         TEXT NOT NULL DEFAULT '[]',
+    standard_answer      TEXT NOT NULL,
+    required_points_json TEXT NOT NULL DEFAULT '[]',
+    source_excerpt       TEXT,
+    generation_mode      TEXT NOT NULL,
+    created_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_prompts_unit
+ON review_prompts(knowledge_unit_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS review_attempts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    knowledge_unit_id INTEGER NOT NULL REFERENCES knowledge_units(id) ON DELETE CASCADE,
+    prompt_id         INTEGER REFERENCES review_prompts(id) ON DELETE SET NULL,
+    seed_card_id      INTEGER REFERENCES cards(id) ON DELETE SET NULL,
+    user_answer       TEXT NOT NULL,
+    ai_feedback       TEXT NOT NULL,
+    rating            INTEGER NOT NULL,
+    reviewed_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_attempts_unit
+ON review_attempts(knowledge_unit_id, reviewed_at DESC);
 
 CREATE TABLE IF NOT EXISTS reviews (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +143,7 @@ pub async fn init(db_path: &str) -> Result<SqlitePool> {
     let pool = SqlitePool::connect(db_path).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     migrate_groups(&pool).await?;
+    migrate_dynamic_review(&pool).await?;
     Ok(pool)
 }
 
@@ -139,6 +175,155 @@ async fn migrate_groups(pool: &SqlitePool) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_notes_group ON notes(group_id)")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn migrate_dynamic_review(pool: &SqlitePool) -> Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(knowledge_units)")
+        .fetch_all(pool)
+        .await?;
+    let has_column = |name: &str| {
+        columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == name)
+    };
+    for (name, statement) in [
+        (
+            "stability",
+            "ALTER TABLE knowledge_units ADD COLUMN stability REAL",
+        ),
+        (
+            "difficulty",
+            "ALTER TABLE knowledge_units ADD COLUMN difficulty REAL",
+        ),
+        ("due", "ALTER TABLE knowledge_units ADD COLUMN due TEXT"),
+        (
+            "reps",
+            "ALTER TABLE knowledge_units ADD COLUMN reps INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "lapses",
+            "ALTER TABLE knowledge_units ADD COLUMN lapses INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "last_review",
+            "ALTER TABLE knowledge_units ADD COLUMN last_review TEXT",
+        ),
+    ] {
+        if !has_column(name) {
+            sqlx::query(statement).execute(pool).await?;
+        }
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE knowledge_units
+         SET stability = COALESCE(stability, (
+                 SELECT c.stability FROM card_knowledge_units cku
+                 JOIN cards c ON c.id = cku.card_id
+                 WHERE cku.knowledge_unit_id = knowledge_units.id
+                 ORDER BY c.id LIMIT 1
+             )),
+             difficulty = COALESCE(difficulty, (
+                 SELECT c.difficulty FROM card_knowledge_units cku
+                 JOIN cards c ON c.id = cku.card_id
+                 WHERE cku.knowledge_unit_id = knowledge_units.id
+                 ORDER BY c.id LIMIT 1
+             )),
+             due = COALESCE(due, (
+                 SELECT c.due FROM card_knowledge_units cku
+                 JOIN cards c ON c.id = cku.card_id
+                 WHERE cku.knowledge_unit_id = knowledge_units.id
+                 ORDER BY c.id LIMIT 1
+             ), ?1),
+             reps = MAX(reps, COALESCE((
+                 SELECT c.reps FROM card_knowledge_units cku
+                 JOIN cards c ON c.id = cku.card_id
+                 WHERE cku.knowledge_unit_id = knowledge_units.id
+                 ORDER BY c.id LIMIT 1
+             ), 0)),
+             lapses = MAX(lapses, COALESCE((
+                 SELECT c.lapses FROM card_knowledge_units cku
+                 JOIN cards c ON c.id = cku.card_id
+                 WHERE cku.knowledge_unit_id = knowledge_units.id
+                 ORDER BY c.id LIMIT 1
+             ), 0)),
+             last_review = COALESCE(last_review, (
+                 SELECT c.last_review FROM card_knowledge_units cku
+                 JOIN cards c ON c.id = cku.card_id
+                 WHERE cku.knowledge_unit_id = knowledge_units.id
+                 ORDER BY c.id LIMIT 1
+             ))",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO knowledge_units
+            (note_id, local_id, topic, objective, unit_type, importance, stage,
+             cognitive_action, required_points_json, claim_ids_json, evidence_json,
+             reason, quick, recommended, generated, stability, difficulty, due,
+             reps, lapses, last_review, prerequisite_ids_json, position)
+         SELECT c.note_id, 'legacy-card-' || c.id, n.title, c.question, 'legacy',
+                'core', 'foundation', 'recall', json_array(c.standard_answer), '[]',
+                json_array(COALESCE(c.source_excerpt, c.standard_answer)),
+                '由旧版卡片迁移', 1, 1, 1, c.stability, c.difficulty, c.due,
+                c.reps, c.lapses, c.last_review, '[]', 1000000 + c.id
+         FROM cards c
+         JOIN notes n ON n.id = c.note_id
+         WHERE NOT EXISTS (
+             SELECT 1 FROM card_knowledge_units cku WHERE cku.card_id = c.id
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE knowledge_units
+         SET required_points_json = CASE
+                 WHEN required_points_json = '[]' THEN json_array((
+                     SELECT c.standard_answer FROM card_knowledge_units cku
+                     JOIN cards c ON c.id = cku.card_id
+                     WHERE cku.knowledge_unit_id = knowledge_units.id
+                     ORDER BY c.id LIMIT 1
+                 ))
+                 ELSE required_points_json
+             END,
+             evidence_json = CASE
+                 WHEN evidence_json = '[]' THEN json_array((
+                     SELECT COALESCE(c.source_excerpt, c.standard_answer)
+                     FROM card_knowledge_units cku
+                     JOIN cards c ON c.id = cku.card_id
+                     WHERE cku.knowledge_unit_id = knowledge_units.id
+                     ORDER BY c.id LIMIT 1
+                 ))
+                 ELSE evidence_json
+             END
+         WHERE unit_type = 'legacy'
+           AND EXISTS (
+               SELECT 1 FROM card_knowledge_units cku
+               WHERE cku.knowledge_unit_id = knowledge_units.id
+           )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO card_knowledge_units (card_id, knowledge_unit_id)
+         SELECT c.id, ku.id
+         FROM cards c
+         JOIN knowledge_units ku
+           ON ku.note_id = c.note_id AND ku.local_id = 'legacy-card-' || c.id
+         WHERE NOT EXISTS (
+             SELECT 1 FROM card_knowledge_units cku WHERE cku.card_id = c.id
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_units_due
+         ON knowledge_units(generated, due)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -185,7 +370,8 @@ mod tests {
         let cards = db::cards::by_note(&pool, note_id).await.unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].question, "PPP 帧格式？");
-        assert!(cards[0].knowledge_unit_id.is_none());
+        assert!(cards[0].knowledge_unit_id.is_some());
+        assert_eq!(cards[0].required_points, vec!["标志字段 0x7E…"]);
         // 新卡 due 是当前时间，应进入复习队列
         let due = db::cards::due(&pool, chrono::Utc::now()).await.unwrap();
         assert_eq!(due.len(), 1);
@@ -269,7 +455,7 @@ mod tests {
         let mapped_cards = db::cards::by_note(&pool, note_id).await.unwrap();
         let mapped = mapped_cards
             .iter()
-            .find(|card| card.knowledge_unit_id.is_some())
+            .find(|card| card.question == "PPP 帧的标志字段是什么？")
             .unwrap();
         assert_eq!(mapped.required_points, vec!["标志字段为 0x7E"]);
 
@@ -392,5 +578,146 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(migrated.get::<String, _>("group_name"), "未分组");
+    }
+
+    #[tokio::test]
+    async fn dynamic_review_migration_preserves_card_schedule_and_is_idempotent() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                question TEXT NOT NULL,
+                standard_answer TEXT NOT NULL,
+                source_excerpt TEXT,
+                stability REAL,
+                difficulty REAL,
+                due TEXT NOT NULL,
+                reps INTEGER NOT NULL DEFAULT 0,
+                lapses INTEGER NOT NULL DEFAULT 0,
+                last_review TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE knowledge_units (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                local_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                unit_type TEXT NOT NULL,
+                importance TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                cognitive_action TEXT NOT NULL,
+                required_points_json TEXT NOT NULL,
+                claim_ids_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                quick INTEGER NOT NULL DEFAULT 0,
+                recommended INTEGER NOT NULL DEFAULT 0,
+                generated INTEGER NOT NULL DEFAULT 0,
+                prerequisite_ids_json TEXT NOT NULL DEFAULT '[]',
+                position INTEGER NOT NULL,
+                UNIQUE(note_id, local_id)
+             );
+             INSERT INTO notes (id, title, content, created_at, updated_at)
+             VALUES (1, '旧版章节', '旧版内容', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO cards
+                (id, note_id, question, standard_answer, source_excerpt,
+                 stability, difficulty, due, reps, lapses, last_review, created_at, updated_at)
+             VALUES
+                (1, 1, '已映射问题', '答案一', NULL, 6.5, 4.25,
+                 '2026-02-01T00:00:00Z', 3, 1, '2026-01-20T00:00:00Z',
+                 '2026-01-01T00:00:00Z', '2026-01-20T00:00:00Z'),
+                (2, 1, '孤立旧卡问题', '答案二', NULL, 2.0, 7.5,
+                 '2026-01-15T00:00:00Z', 2, 0, '2026-01-10T00:00:00Z',
+                 '2026-01-01T00:00:00Z', '2026-01-10T00:00:00Z');
+             INSERT INTO knowledge_units
+                (id, note_id, local_id, topic, objective, unit_type, importance, stage,
+                 cognitive_action, required_points_json, claim_ids_json, evidence_json,
+                 reason, quick, recommended, generated, prerequisite_ids_json, position)
+             VALUES
+                (1, 1, 'K1', '旧知识单元', '掌握旧知识', 'concept', 'core', 'foundation',
+                 'recall', '[\"要点\"]', '[]', '[\"证据\"]', '旧版蓝图', 1, 1, 1, '[]', 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+        migrate_groups(&pool).await.unwrap();
+        sqlx::query("INSERT INTO card_knowledge_units (card_id, knowledge_unit_id) VALUES (1, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate_dynamic_review(&pool).await.unwrap();
+
+        let mapped = sqlx::query(
+            "SELECT stability, difficulty, due, reps, lapses, last_review
+             FROM knowledge_units WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!((mapped.get::<f64, _>("stability") - 6.5).abs() < f64::EPSILON);
+        assert!((mapped.get::<f64, _>("difficulty") - 4.25).abs() < f64::EPSILON);
+        assert_eq!(mapped.get::<String, _>("due"), "2026-02-01T00:00:00Z");
+        assert_eq!(mapped.get::<i64, _>("reps"), 3);
+        assert_eq!(mapped.get::<i64, _>("lapses"), 1);
+        assert_eq!(
+            mapped.get::<String, _>("last_review"),
+            "2026-01-20T00:00:00Z"
+        );
+
+        let synthetic = sqlx::query(
+            "SELECT ku.stability, ku.difficulty, ku.due, ku.reps, ku.lapses,
+                    ku.required_points_json, ku.evidence_json, cku.card_id
+             FROM knowledge_units ku
+             JOIN card_knowledge_units cku ON cku.knowledge_unit_id = ku.id
+             WHERE ku.local_id = 'legacy-card-2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(synthetic.get::<i64, _>("card_id"), 2);
+        assert!((synthetic.get::<f64, _>("stability") - 2.0).abs() < f64::EPSILON);
+        assert!((synthetic.get::<f64, _>("difficulty") - 7.5).abs() < f64::EPSILON);
+        assert_eq!(synthetic.get::<i64, _>("reps"), 2);
+        assert_eq!(synthetic.get::<i64, _>("lapses"), 0);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(
+                &synthetic.get::<String, _>("required_points_json")
+            )
+            .unwrap(),
+            vec!["答案二"]
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&synthetic.get::<String, _>("evidence_json"))
+                .unwrap(),
+            vec!["答案二"]
+        );
+
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+        migrate_groups(&pool).await.unwrap();
+        migrate_dynamic_review(&pool).await.unwrap();
+        let unit_count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM knowledge_units")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("count");
+        let mapping_count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM card_knowledge_units")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("count");
+        assert_eq!(unit_count, 2);
+        assert_eq!(mapping_count, 2);
     }
 }

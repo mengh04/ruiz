@@ -191,7 +191,9 @@ fn json_request_body(model: &str, system: &str, user: &str, max_tokens: u32) -> 
 }
 
 fn max_output_tokens_for(operation: &str) -> u32 {
-    if operation.starts_with("import.organize") || operation.starts_with("answer.judge") {
+    if operation.starts_with("review.question.generate") {
+        8_192
+    } else if operation.starts_with("import.organize") || operation.starts_with("answer.judge") {
         32_768
     } else {
         DEEPSEEK_MAX_OUTPUT_TOKENS
@@ -405,6 +407,7 @@ mod tests {
 
     #[test]
     fn deepseek_output_budgets_match_workflow_size() {
+        assert_eq!(max_output_tokens_for("review.question.generate"), 8_192);
         assert_eq!(max_output_tokens_for("answer.judge"), 32_768);
         assert_eq!(max_output_tokens_for("plan.extract"), 384_000);
         assert_eq!(max_output_tokens_for("plan.reconcile"), 384_000);

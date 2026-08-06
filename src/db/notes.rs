@@ -91,6 +91,20 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
         .bind(id)
         .execute(&mut *transaction)
         .await?;
+    sqlx::query(
+        "DELETE FROM review_attempts
+         WHERE knowledge_unit_id IN (SELECT id FROM knowledge_units WHERE note_id = ?1)",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM review_prompts
+         WHERE knowledge_unit_id IN (SELECT id FROM knowledge_units WHERE note_id = ?1)",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query("DELETE FROM knowledge_units WHERE note_id = ?1")
         .bind(id)
         .execute(&mut *transaction)

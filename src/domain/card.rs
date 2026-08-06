@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use fsrs::MemoryState;
 
-/// 一张卡片：一个「问题 + 标准答案 + 原文引用」，
-/// 附带 FSRS 记忆状态用于间隔重复调度。
+/// 一道兼容旧版数据的基础题：一个「问题 + 标准答案 + 原文引用」。
+/// 动态复习以关联知识单元上的 FSRS 状态为准。
 #[derive(Debug, Clone)]
 pub struct Card {
     pub id: i64,
@@ -12,7 +12,7 @@ pub struct Card {
     pub standard_answer: String,
     /// 原文中与本题相关的片段（可选）
     pub source_excerpt: Option<String>,
-    /// 新版智能导入卡片关联的知识单元；旧卡为 None。
+    /// 基础题关联的知识单元；旧数据会在数据库迁移时自动补建关联。
     #[allow(dead_code)]
     pub knowledge_unit_id: Option<i64>,
     /// AI 判题时逐项检查的明确必答点。
