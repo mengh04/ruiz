@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::dynamic_review::ReviewState;
+
 /// 材料分析摘要，用于解释 AI 为什么推荐当前题量。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterialAnalysis {
@@ -41,6 +43,8 @@ pub struct KnowledgeUnit {
     pub quick: bool,
     pub recommended: bool,
     pub generated: bool,
+    #[serde(skip)]
+    pub review_state: ReviewState,
     pub prerequisite_unit_ids: Vec<String>,
     pub position: usize,
 }

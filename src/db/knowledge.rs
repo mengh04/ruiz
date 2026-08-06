@@ -283,6 +283,15 @@ async fn insert_question(
 }
 
 fn unit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<KnowledgeUnit> {
+    let stability: Option<f32> = row.get("stability");
+    let difficulty: Option<f32> = row.get("difficulty");
+    let memory = match (stability, difficulty) {
+        (Some(stability), Some(difficulty)) => Some(fsrs::MemoryState {
+            stability,
+            difficulty,
+        }),
+        _ => None,
+    };
     Ok(KnowledgeUnit {
         id: row.get("id"),
         note_id: row.get("note_id"),
@@ -303,6 +312,12 @@ fn unit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<KnowledgeUnit> {
         quick: row.get::<i64, _>("quick") != 0,
         recommended: row.get::<i64, _>("recommended") != 0,
         generated: row.get::<i64, _>("generated") != 0,
+        review_state: crate::domain::dynamic_review::ReviewState {
+            memory,
+            reps: row.get::<i64, _>("reps") as u32,
+            lapses: row.get::<i64, _>("lapses") as u32,
+            last_review: row.get("last_review"),
+        },
         prerequisite_unit_ids: parse_json(
             row.get::<String, _>("prerequisite_ids_json"),
             "prerequisite_ids_json",

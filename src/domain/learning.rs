@@ -844,6 +844,7 @@ mod tests {
             quick: true,
             recommended: true,
             generated: true,
+            review_state: Default::default(),
             prerequisite_unit_ids: vec![],
             position: 0,
         }];

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use fsrs::MemoryState;
+use fsrs::{FSRS6_DEFAULT_DECAY, MemoryState, current_retrievability};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,74 @@ pub enum MasteryBand {
     Strong,
 }
 
+/// 知识蓝图环形熟练度使用的颜色分级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProficiencyLevel {
+    Unassessed,
+    Low,
+    Medium,
+    High,
+}
+
+/// 知识单元的 FSRS 记忆状态，同时供复习调度和知识蓝图展示使用。
+#[derive(Debug, Clone, Default)]
+pub struct ReviewState {
+    pub memory: Option<MemoryState>,
+    pub reps: u32,
+    pub lapses: u32,
+    pub last_review: Option<DateTime<Utc>>,
+}
+
+impl ReviewState {
+    pub fn days_elapsed(&self, now: DateTime<Utc>) -> u32 {
+        self.last_review
+            .map(|last| (now - last).num_days().max(0) as u32)
+            .unwrap_or(0)
+    }
+
+    pub fn mastery_band(&self) -> MasteryBand {
+        let unstable = self
+            .memory
+            .is_some_and(|memory| memory.stability < 7.0 || memory.difficulty > 7.0);
+        if self.reps <= 1 || self.lapses.saturating_mul(2) >= self.reps.max(1) {
+            MasteryBand::Beginner
+        } else if self.reps < 5 || unstable {
+            MasteryBand::Developing
+        } else {
+            MasteryBand::Strong
+        }
+    }
+
+    /// 百分制熟练度同时考虑此刻能否回忆和记忆能保持多久。
+    /// 稳定性每增加 7 天完成一半剩余成长，避免刚复习后的回忆率虚高。
+    pub fn proficiency(&self, now: DateTime<Utc>) -> Option<f32> {
+        if self.reps == 0 || self.memory.is_none() || self.last_review.is_none() {
+            return None;
+        }
+        let memory = self.memory?;
+        let retrievability = self.retrievability(now)?;
+        let durability = 1.0 - 2.0_f32.powf(-memory.stability.max(0.0) / 7.0);
+        Some((retrievability * durability * 100.0).clamp(0.0, 100.0))
+    }
+
+    pub fn proficiency_level(&self, now: DateTime<Utc>) -> ProficiencyLevel {
+        match self.proficiency(now) {
+            None => ProficiencyLevel::Unassessed,
+            Some(score) if score < 40.0 => ProficiencyLevel::Low,
+            Some(score) if score < 75.0 => ProficiencyLevel::Medium,
+            Some(_) => ProficiencyLevel::High,
+        }
+    }
+
+    /// 基于 FSRS-6 遗忘曲线计算此刻成功回忆的概率。
+    pub fn retrievability(&self, now: DateTime<Utc>) -> Option<f32> {
+        let memory = self.memory?;
+        let last_review = self.last_review?;
+        let elapsed_days = (now - last_review).num_seconds().max(0) as f32 / 86_400.0;
+        Some(current_retrievability(memory, elapsed_days, FSRS6_DEFAULT_DECAY).clamp(0.0, 1.0))
+    }
+}
+
 impl MasteryBand {
     pub fn label(self) -> &'static str {
         match self {
@@ -89,21 +157,19 @@ pub struct ReviewItem {
 
 impl ReviewItem {
     pub fn days_elapsed(&self, now: DateTime<Utc>) -> u32 {
-        self.last_review
-            .map(|last| (now - last).num_days().max(0) as u32)
-            .unwrap_or(0)
+        self.review_state().days_elapsed(now)
     }
 
     pub fn mastery_band(&self) -> MasteryBand {
-        let unstable = self
-            .memory
-            .is_some_and(|memory| memory.stability < 7.0 || memory.difficulty > 7.0);
-        if self.reps <= 1 || self.lapses.saturating_mul(2) >= self.reps.max(1) {
-            MasteryBand::Beginner
-        } else if self.reps < 5 || unstable {
-            MasteryBand::Developing
-        } else {
-            MasteryBand::Strong
+        self.review_state().mastery_band()
+    }
+
+    pub fn review_state(&self) -> ReviewState {
+        ReviewState {
+            memory: self.memory,
+            reps: self.reps,
+            lapses: self.lapses,
+            last_review: self.last_review,
         }
     }
 
@@ -177,6 +243,7 @@ pub struct ReviewPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, TimeZone};
 
     fn item(reps: u32, lapses: u32, memory: Option<MemoryState>) -> ReviewItem {
         ReviewItem {
@@ -225,5 +292,32 @@ mod tests {
             .question_format(true),
             QuestionFormat::ShortAnswer
         );
+    }
+
+    #[test]
+    fn review_state_exposes_proficiency_and_retrievability() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap();
+        let unassessed = ReviewState::default();
+        assert_eq!(
+            unassessed.proficiency_level(now),
+            ProficiencyLevel::Unassessed
+        );
+        assert_eq!(unassessed.proficiency(now), None);
+        assert_eq!(unassessed.retrievability(now), None);
+
+        let assessed = ReviewState {
+            memory: Some(MemoryState {
+                stability: 7.0,
+                difficulty: 4.0,
+            }),
+            reps: 5,
+            lapses: 0,
+            last_review: Some(now - Duration::days(7)),
+        };
+        let retrievability = assessed.retrievability(now).unwrap();
+        assert!((retrievability - 0.9).abs() < 0.0001);
+        let proficiency = assessed.proficiency(now).unwrap();
+        assert!((proficiency - 45.0).abs() < 0.01);
+        assert_eq!(assessed.proficiency_level(now), ProficiencyLevel::Medium);
     }
 }

@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use gpui::{
     AnyWindowHandle, Context, Entity, IntoElement, MouseButton, NavigationDirection, Render,
     ScrollHandle, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point,
@@ -15,6 +16,7 @@ use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::progress::ProgressCircle;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
@@ -31,6 +33,7 @@ use gpui_component::{
 use crate::ai::progress::{ImportCancellation, ImportEvent, ImportProgress, ImportStage};
 use crate::assets::RuizIcon;
 use crate::db;
+use crate::domain::dynamic_review::{ProficiencyLevel, ReviewState};
 use crate::domain::group::StudyGroup;
 use crate::domain::knowledge::{KnowledgeUnit, MaterialAnalysis};
 use crate::domain::note::Note;
@@ -2114,6 +2117,7 @@ impl Render for NotesView {
                 let blueprint = if self.units.is_empty() {
                     div().into_any_element()
                 } else {
+                    let now = Utc::now();
                     GroupBox::new()
                         .fill()
                         .title(
@@ -2126,6 +2130,9 @@ impl Render for NotesView {
                         .child(v_flex().gap_2().children(self.units.iter().map(|unit| {
                             let (importance_label, importance_color) =
                                 importance_style(&unit.importance, cx);
+                            let proficiency = unit.review_state.proficiency(now).unwrap_or(0.0);
+                            let proficiency_color =
+                                proficiency_color(unit.review_state.proficiency_level(now), cx);
                             h_flex()
                                 .items_start()
                                 .gap_3()
@@ -2145,15 +2152,19 @@ impl Render for NotesView {
                                     v_flex()
                                         .min_w_0()
                                         .flex_1()
-                                        .gap_1()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(SharedString::from(unit.objective.clone())),
+                                        )
                                         .child(
                                             h_flex()
-                                                .items_center()
                                                 .gap_2()
                                                 .flex_wrap()
-                                                .child(div().text_sm().font_medium().child(
-                                                    SharedString::from(unit.objective.clone()),
-                                                ))
                                                 .child(
                                                     div()
                                                         .px_1p5()
@@ -2183,12 +2194,44 @@ impl Render for NotesView {
                                                     "{} · {} 个必答点 · {}",
                                                     unit.topic,
                                                     unit.required_points.len(),
-                                                    if unit.generated {
-                                                        "已准备复习"
-                                                    } else {
-                                                        "暂未纳入复习"
-                                                    }
+                                                    review_summary_label(
+                                                        &unit.review_state,
+                                                        unit.generated,
+                                                    )
                                                 )),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .w_20()
+                                        .self_center()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap_1()
+                                        .pl_3()
+                                        .border_l_1()
+                                        .border_color(colors.border)
+                                        .child(
+                                            ProgressCircle::new(format!(
+                                                "unit-proficiency-{}",
+                                                unit.id
+                                            ))
+                                            .value(proficiency)
+                                            .color(proficiency_color)
+                                            .size_12()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_semibold()
+                                                    .text_color(proficiency_color)
+                                                    .child(format!("{proficiency:.0}%")),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(colors.muted_foreground)
+                                                .child("熟练度"),
                                         ),
                                 )
                         })))
@@ -2400,6 +2443,31 @@ fn importance_style(importance: &str, cx: &gpui::App) -> (&'static str, gpui::Hs
     }
 }
 
+fn proficiency_color(level: ProficiencyLevel, cx: &gpui::App) -> gpui::Hsla {
+    match level {
+        ProficiencyLevel::Unassessed => cx.theme().muted_foreground,
+        ProficiencyLevel::Low => cx.theme().red,
+        ProficiencyLevel::Medium => cx.theme().yellow,
+        ProficiencyLevel::High => cx.theme().green,
+    }
+}
+
+fn review_summary_label(state: &ReviewState, generated: bool) -> String {
+    if state.reps == 0 || state.memory.is_none() || state.last_review.is_none() {
+        return if generated {
+            "等待首次复习".into()
+        } else {
+            "暂未纳入复习".into()
+        };
+    }
+    let lapse_detail = if state.lapses == 0 {
+        String::new()
+    } else {
+        format!(" · 遗忘 {} 次", state.lapses)
+    };
+    format!("已复习 {} 次{}", state.reps, lapse_detail)
+}
+
 fn unit_type_label(unit_type: &str) -> &'static str {
     match unit_type {
         "concept" => "概念",
@@ -2418,7 +2486,11 @@ fn matches_group_filter(group_id: i64, selected_group_ids: &[i64]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_group_filter;
+    use chrono::{Duration, TimeZone, Utc};
+    use fsrs::MemoryState;
+
+    use super::{matches_group_filter, review_summary_label};
+    use crate::domain::dynamic_review::ReviewState;
 
     #[test]
     fn empty_group_filter_includes_every_material() {
@@ -2429,5 +2501,28 @@ mod tests {
     fn multiple_group_filters_use_union_semantics() {
         assert!(matches_group_filter(2, &[1, 2, 3]));
         assert!(!matches_group_filter(4, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn review_summary_requires_an_assessed_memory_state() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap();
+        assert_eq!(
+            review_summary_label(&ReviewState::default(), true),
+            "等待首次复习"
+        );
+
+        let state = ReviewState {
+            memory: Some(MemoryState {
+                stability: 10.0,
+                difficulty: 4.0,
+            }),
+            reps: 5,
+            lapses: 1,
+            last_review: Some(now - Duration::days(10)),
+        };
+        assert_eq!(
+            review_summary_label(&state, true),
+            "已复习 5 次 · 遗忘 1 次"
+        );
     }
 }
