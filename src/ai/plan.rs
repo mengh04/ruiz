@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostics;
 
 use super::{
-    client::ChatClient,
-    progress::{ImportProgress, ImportProgressReporter, ImportStage},
+    client::{ChatClient, StreamEvent},
+    progress::{ImportCancellation, ImportEvent, ImportEventReporter, ImportProgress, ImportStage},
     prompts::{PLAN_CHUNK_SYSTEM, PLAN_RECONCILE_SYSTEM, PLAN_REPAIR_SYSTEM},
 };
 
@@ -70,40 +70,55 @@ pub async fn analyze_material(
     title: &str,
     content: &str,
 ) -> Result<MaterialPlan> {
-    let silent = |_: ImportProgress| {};
-    analyze_material_with_progress(client, title, content, &silent).await
+    let silent = |_: ImportEvent| {};
+    let cancellation = ImportCancellation::default();
+    analyze_material_with_progress(client, title, content, &silent, &cancellation).await
 }
 
 pub async fn analyze_material_with_progress(
     client: &ChatClient,
     title: &str,
     content: &str,
-    progress: &ImportProgressReporter,
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
 ) -> Result<MaterialPlan> {
-    progress(ImportProgress::stage(
+    cancellation.ensure_active()?;
+    progress(ImportEvent::Stage(ImportProgress::stage(
         ImportStage::Extracting,
         format!(
             "正在一次性分析《{title}》全文（{} 个字符）",
             content.chars().count()
         ),
-    ));
+    )));
     let input = serde_json::json!({
         "material_title": title,
         "content": content,
     });
+    let report_stream = |event| {
+        if let StreamEvent::Thinking(text) = event {
+            progress(ImportEvent::Thinking(text));
+        }
+    };
     let value = client
-        .chat_json_for("plan.extract", PLAN_CHUNK_SYSTEM, &input.to_string())
+        .chat_json_stream_for(
+            "plan.extract",
+            PLAN_CHUNK_SYSTEM,
+            &input.to_string(),
+            &report_stream,
+            Some(cancellation),
+        )
         .await?;
     let mut candidate: ChunkPlan =
         serde_json::from_value(value).map_err(|error| anyhow!("知识提取响应格式不对: {error}"))?;
     prefix_chunk_ids(&mut candidate, 1);
     let candidates = vec![candidate];
 
-    progress(ImportProgress::stage(
+    cancellation.ensure_active()?;
+    progress(ImportEvent::Stage(ImportProgress::stage(
         ImportStage::Reconciling,
         format!("正在去重并整理《{title}》的最终知识蓝图"),
-    ));
-    let plan = reconcile_once(client, title, &candidates).await?;
+    )));
+    let plan = reconcile_once(client, title, &candidates, progress, cancellation).await?;
     match validate_plan(plan.clone()) {
         Ok(plan) => Ok(plan),
         Err(initial_error) => {
@@ -117,17 +132,22 @@ pub async fn analyze_material_with_progress(
                     "units": plan.units.len(),
                 }),
             );
-            progress(ImportProgress::stage(
+            progress(ImportEvent::Stage(ImportProgress::stage(
                 ImportStage::Reconciling,
                 format!("正在修复《{title}》知识蓝图中的结构字段"),
-            ));
-            let repaired = repair_plan(client, title, &plan, &initial_error.to_string())
-                .await
-                .map_err(|repair_error| {
-                    anyhow!(
-                        "知识蓝图首次校验失败：{initial_error}；AI 结构修复失败：{repair_error}"
-                    )
-                })?;
+            )));
+            let repaired = repair_plan(
+                client,
+                title,
+                &plan,
+                &initial_error.to_string(),
+                progress,
+                cancellation,
+            )
+            .await
+            .map_err(|repair_error| {
+                anyhow!("知识蓝图首次校验失败：{initial_error}；AI 结构修复失败：{repair_error}")
+            })?;
             validate_plan(repaired).map_err(|repair_error| {
                 diagnostics::error(
                     "plan.validation.repair_failed",
@@ -148,13 +168,26 @@ async fn reconcile_once(
     client: &ChatClient,
     title: &str,
     candidates: &[ChunkPlan],
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
 ) -> Result<MaterialPlan> {
     let input = serde_json::json!({
         "material_title": title,
         "candidate_chunks": candidates,
     });
+    let report_stream = |event| {
+        if let StreamEvent::Thinking(text) = event {
+            progress(ImportEvent::Thinking(text));
+        }
+    };
     let value = client
-        .chat_json_for("plan.reconcile", PLAN_RECONCILE_SYSTEM, &input.to_string())
+        .chat_json_stream_for(
+            "plan.reconcile",
+            PLAN_RECONCILE_SYSTEM,
+            &input.to_string(),
+            &report_stream,
+            Some(cancellation),
+        )
         .await?;
     serde_json::from_value(value).map_err(|error| anyhow!("知识蓝图响应格式不对: {error}"))
 }
@@ -164,14 +197,27 @@ async fn repair_plan(
     title: &str,
     plan: &MaterialPlan,
     validation_error: &str,
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
 ) -> Result<MaterialPlan> {
     let input = serde_json::json!({
         "material_title": title,
         "validation_error": validation_error,
         "draft_plan": plan,
     });
+    let report_stream = |event| {
+        if let StreamEvent::Thinking(text) = event {
+            progress(ImportEvent::Thinking(text));
+        }
+    };
     let value = client
-        .chat_json_for("plan.repair", PLAN_REPAIR_SYSTEM, &input.to_string())
+        .chat_json_stream_for(
+            "plan.repair",
+            PLAN_REPAIR_SYSTEM,
+            &input.to_string(),
+            &report_stream,
+            Some(cancellation),
+        )
         .await?;
     serde_json::from_value(value).map_err(|error| anyhow!("知识蓝图修复响应格式不对: {error}"))
 }

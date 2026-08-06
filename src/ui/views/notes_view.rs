@@ -1,5 +1,7 @@
 //! 笔记视图：导入学习材料、建立知识蓝图、管理动态复习的基础题。
 
+use std::time::{Duration, Instant};
+
 use gpui::{
     AnyWindowHandle, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Window, div,
     point, prelude::*, px,
@@ -21,7 +23,7 @@ use gpui_component::{
     WindowExt as _, h_flex, v_flex,
 };
 
-use crate::ai::progress::{ImportProgress, ImportStage};
+use crate::ai::progress::{ImportCancellation, ImportEvent, ImportProgress, ImportStage};
 use crate::assets::RuizIcon;
 use crate::db;
 use crate::domain::card::Card;
@@ -47,6 +49,12 @@ pub struct NotesView {
     cards_loading: bool,
     importing: bool,
     import_progress: Option<ImportProgress>,
+    import_thinking: String,
+    import_thinking_chars: usize,
+    import_thinking_expanded: bool,
+    import_started_at: Option<Instant>,
+    import_cancellation: Option<ImportCancellation>,
+    import_cancelling: bool,
     generating: bool,
     generation_scope: GenerationScope,
     deleting_note_id: Option<i64>,
@@ -115,6 +123,7 @@ impl NotesPage {
 #[derive(Clone)]
 enum Message {
     Success(String),
+    Warning(String),
     Error(String),
 }
 
@@ -162,6 +171,12 @@ impl NotesView {
             cards_loading: false,
             importing: false,
             import_progress: None,
+            import_thinking: String::new(),
+            import_thinking_chars: 0,
+            import_thinking_expanded: false,
+            import_started_at: None,
+            import_cancellation: None,
+            import_cancelling: false,
             generating: false,
             generation_scope: GenerationScope::default(),
             deleting_note_id: None,
@@ -173,6 +188,45 @@ impl NotesView {
         view.refresh_notes(cx);
         view.refresh_groups(cx);
         view
+    }
+
+    fn append_import_thinking(&mut self, text: &str) {
+        const MAX_VISIBLE_CHARS: usize = 12_000;
+
+        let incoming_chars = text.chars().count();
+        self.import_thinking_chars += incoming_chars;
+        if incoming_chars >= MAX_VISIBLE_CHARS {
+            self.import_thinking = text
+                .chars()
+                .skip(incoming_chars - MAX_VISIBLE_CHARS)
+                .collect();
+            return;
+        }
+        self.import_thinking.push_str(text);
+        let visible_chars = self.import_thinking.chars().count();
+        if visible_chars > MAX_VISIBLE_CHARS {
+            self.import_thinking = self
+                .import_thinking
+                .chars()
+                .skip(visible_chars - MAX_VISIBLE_CHARS)
+                .collect();
+        }
+    }
+
+    fn cancel_import(&mut self, cx: &mut Context<Self>) {
+        if !self.importing || self.import_cancelling {
+            return;
+        }
+        if let Some(cancellation) = &self.import_cancellation {
+            if !cancellation.cancel() {
+                return;
+            }
+            self.import_cancelling = true;
+            if let Some(progress) = &mut self.import_progress {
+                progress.detail = "正在停止当前 AI 请求，已生成的临时结果不会写入资料库".into();
+            }
+            cx.notify();
+        }
     }
 
     fn refresh_groups(&mut self, cx: &mut Context<Self>) {
@@ -331,23 +385,62 @@ impl NotesView {
         } else {
             requested_group
         };
+        let cancellation = ImportCancellation::default();
         self.importing = true;
         self.import_group_selection_changed = false;
         self.import_progress = Some(ImportProgress::preparing());
+        self.import_thinking.clear();
+        self.import_thinking_chars = 0;
+        self.import_thinking_expanded = false;
+        self.import_started_at = Some(Instant::now());
+        self.import_cancellation = Some(cancellation.clone());
+        self.import_cancelling = false;
         self.message = None;
         cx.notify();
         let content_input = self.content.clone();
         let window_handle = self.window;
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<ImportEvent>();
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
                 let mut cx = (*cx).clone();
                 async move {
-                    while let Some(progress) = progress_rx.recv().await {
+                    let mut pending_stage = None;
+                    let mut pending_thinking = String::new();
+                    let mut last_update = Instant::now()
+                        .checked_sub(Duration::from_millis(100))
+                        .unwrap_or_else(Instant::now);
+                    while let Some(event) = progress_rx.recv().await {
+                        match event {
+                            ImportEvent::Stage(progress) => pending_stage = Some(progress),
+                            ImportEvent::Thinking(text) => pending_thinking.push_str(&text),
+                        }
+                        let should_update = pending_stage.is_some()
+                            || last_update.elapsed() >= Duration::from_millis(100)
+                            || pending_thinking.len() >= 512;
+                        if !should_update {
+                            continue;
+                        }
+                        let stage = pending_stage.take();
+                        let thinking = std::mem::take(&mut pending_thinking);
                         this.update(&mut cx, |this, cx| {
                             if this.importing {
-                                this.import_progress = Some(progress);
+                                if let Some(stage) = stage {
+                                    this.import_progress = Some(stage);
+                                }
+                                if !thinking.is_empty() {
+                                    this.append_import_thinking(&thinking);
+                                }
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        last_update = Instant::now();
+                    }
+                    if !pending_thinking.is_empty() {
+                        this.update(&mut cx, |this, cx| {
+                            if this.importing {
+                                this.append_import_thinking(&pending_thinking);
                                 cx.notify();
                             }
                         })
@@ -359,23 +452,53 @@ impl NotesView {
         .detach();
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
+                let mut cx = (*cx).clone();
+                async move {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        let keep_running = this
+                            .update(&mut cx, |this, cx| {
+                                if this.importing {
+                                    cx.notify();
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or(false);
+                        if !keep_running {
+                            break;
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+        cx.spawn(
+            move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
                 let mut cx = (*cx).clone();
                 async move {
+                    let task_cancellation = cancellation.clone();
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
-                        let report = move |progress| {
-                            let _ = progress_tx.send(progress);
+                        let report = move |event| {
+                            let _ = progress_tx.send(event);
                         };
                         let prepared = crate::ai::workflow::prepare_import_with_progress(
-                            &ai, &content, &report,
+                            &ai,
+                            &content,
+                            &report,
+                            &task_cancellation,
                         )
                         .await?;
-                        report(ImportProgress::stage(
+                        task_cancellation.begin_persistence()?;
+                        report(ImportEvent::Stage(ImportProgress::stage(
                             ImportStage::Saving,
                             "AI 结果已经校验完成，正在原子写入资料库",
-                        ));
-                            let group_id = db::groups::get_or_create(&pool, &requested_group).await?;
-                            db::knowledge::save_import(&pool, group_id, &prepared).await
+                        )));
+                        let group_id = db::groups::get_or_create(&pool, &requested_group).await?;
+                        task_cancellation.ensure_active()?;
+                        db::knowledge::save_import(&pool, group_id, &prepared).await
                     })
                     .await;
                     match result {
@@ -405,6 +528,9 @@ impl NotesView {
                             this.update(&mut cx, |this, cx| {
                                 this.importing = false;
                                 this.import_progress = None;
+                                this.import_started_at = None;
+                                this.import_cancellation = None;
+                                this.import_cancelling = false;
                                 this.page = only_note
                                     .map(NotesPage::Detail)
                                     .unwrap_or(NotesPage::Library);
@@ -420,18 +546,36 @@ impl NotesView {
                             .ok();
                         }
                         Err(e) => {
-                            crate::diagnostics::error(
-                                "import.ui.failed",
-                                "Smart import failed before persistence completed",
-                                serde_json::json!({ "error": format!("{e:#}") }),
-                            );
+                            let was_cancelled = cancellation.is_cancelled();
+                            if was_cancelled {
+                                crate::diagnostics::info(
+                                    "import.ui.cancelled",
+                                    "Smart import was cancelled before persistence",
+                                    serde_json::json!({}),
+                                );
+                            } else {
+                                crate::diagnostics::error(
+                                    "import.ui.failed",
+                                    "Smart import failed before persistence completed",
+                                    serde_json::json!({ "error": format!("{e:#}") }),
+                                );
+                            }
                             this.update(&mut cx, |this, cx| {
                                 this.importing = false;
                                 this.import_progress = None;
-                                this.message = Some(Message::Error(format!(
-                                    "智能导入失败: {e}\n{}",
-                                    crate::diagnostics::log_hint()
-                                )));
+                                this.import_started_at = None;
+                                this.import_cancellation = None;
+                                this.import_cancelling = false;
+                                this.message = if was_cancelled {
+                                    Some(Message::Warning(
+                                        "已取消智能导入，临时结果未写入资料库".into(),
+                                    ))
+                                } else {
+                                    Some(Message::Error(format!(
+                                        "智能导入失败: {e}\n{}",
+                                        crate::diagnostics::log_hint()
+                                    )))
+                                };
                                 cx.notify();
                             })
                             .ok();
@@ -1146,6 +1290,19 @@ impl Render for NotesView {
         } else {
             format!("阶段 {import_stage_position}/{}", ImportStage::TOTAL)
         };
+        let import_elapsed = self
+            .import_started_at
+            .map(|started| format_elapsed(started.elapsed()))
+            .unwrap_or_else(|| "0 秒".into());
+        let import_thinking = self.import_thinking.clone();
+        let import_thinking_chars = self.import_thinking_chars;
+        let import_thinking_expanded = self.import_thinking_expanded;
+        let import_cancelling = self.import_cancelling;
+        let import_can_cancel = self
+            .import_cancellation
+            .as_ref()
+            .is_some_and(ImportCancellation::can_cancel)
+            && !import_cancelling;
 
         let header = match self.page {
             NotesPage::Library => page_header(
@@ -1228,6 +1385,13 @@ impl Render for NotesView {
                         cx.notify();
                     }))
                     .into_any_element(),
+                Message::Warning(msg) => Alert::warning("note-alert", msg)
+                    .banner()
+                    .on_close(cx.listener(|this, _, _, cx| {
+                        this.message = None;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
                 Message::Error(msg) => Alert::error("note-alert", msg)
                     .banner()
                     .on_close(cx.listener(|this, _, _, cx| {
@@ -1295,10 +1459,37 @@ impl Render for NotesView {
                                 .mb_4()
                                 .title(
                                     h_flex()
+                                        .w_full()
                                         .items_center()
+                                        .justify_between()
                                         .gap_2()
-                                        .child(Spinner::new().small().color(colors.primary))
-                                        .child(format!("AI 正在{}", import_progress.stage.label())),
+                                        .flex_wrap()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(Spinner::new().small().color(colors.primary))
+                                                .child(format!(
+                                                    "AI 正在{}",
+                                                    import_progress.stage.label()
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("cancel-running-import")
+                                                .icon(IconName::CircleX)
+                                                .label(if import_cancelling {
+                                                    "正在停止"
+                                                } else {
+                                                    "停止导入"
+                                                })
+                                                .small()
+                                                .danger()
+                                                .outline()
+                                                .disabled(!import_can_cancel)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_import(cx);
+                                                })),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -1321,15 +1512,91 @@ impl Render for NotesView {
                                     h_flex()
                                         .items_center()
                                         .gap_2()
+                                        .flex_wrap()
                                         .text_xs()
                                         .text_color(colors.muted_foreground)
-                                        .child(import_stage_counter.clone()),
+                                        .child(import_stage_counter.clone())
+                                        .child("·")
+                                        .child(format!("已运行 {import_elapsed}"))
+                                        .child("·")
+                                        .child(format!(
+                                            "已接收 {import_thinking_chars} 个思考字符"
+                                        )),
                                 )
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(colors.muted_foreground)
-                                        .child(crate::diagnostics::log_hint()),
+                                    v_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_2()
+                                                .child(
+                                                    h_flex()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .text_sm()
+                                                        .font_medium()
+                                                        .child("AI 工作记录")
+                                                        .child(
+                                                            div()
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .bg(colors.warning.opacity(0.12))
+                                                                .text_xs()
+                                                                .text_color(colors.warning)
+                                                                .child("Beta"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    Button::new("toggle-import-thinking")
+                                                        .icon(if import_thinking_expanded {
+                                                            IconName::ChevronUp
+                                                        } else {
+                                                            IconName::ChevronDown
+                                                        })
+                                                        .label(if import_thinking_expanded {
+                                                            "收起"
+                                                        } else {
+                                                            "展开"
+                                                        })
+                                                        .small()
+                                                        .outline()
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.import_thinking_expanded =
+                                                                !this.import_thinking_expanded;
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        )
+                                        .when(import_thinking_expanded, |this| {
+                                            this.child(
+                                                div()
+                                                    .w_full()
+                                                    .max_h(px(180.))
+                                                    .overflow_y_scrollbar()
+                                                    .p_2()
+                                                    .rounded_md()
+                                                    .bg(colors.muted)
+                                                    .text_xs()
+                                                    .text_color(colors.muted_foreground)
+                                                    .whitespace_normal()
+                                                    .child(if import_thinking.is_empty() {
+                                                        "正在等待模型返回思考内容…".into()
+                                                    } else {
+                                                        SharedString::from(import_thinking.clone())
+                                                    }),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(colors.muted_foreground)
+                                                .child(crate::diagnostics::log_hint()),
+                                        ),
                                 )
                                 .child(Skeleton::new().secondary().w_4_5()),
                         )
@@ -1967,6 +2234,15 @@ fn preview(content: &str, limit: usize) -> String {
         preview.push('…');
     }
     preview
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else {
+        format!("{} 分 {:02} 秒", seconds / 60, seconds % 60)
+    }
 }
 
 fn importance_style(importance: &str, cx: &gpui::App) -> (&'static str, gpui::Hsla) {

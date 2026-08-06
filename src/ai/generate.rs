@@ -4,9 +4,9 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    client::ChatClient,
+    client::{ChatClient, StreamEvent},
     plan::PlanUnit,
-    progress::{ImportProgress, ImportProgressReporter, ImportStage},
+    progress::{ImportCancellation, ImportEvent, ImportEventReporter, ImportProgress, ImportStage},
     prompts::GENERATE_SYSTEM,
 };
 
@@ -29,29 +29,43 @@ struct QuestionResponse {
 
 /// 为已经选定的知识单元逐一生成问题，不再要求模型凑固定题数。
 pub async fn generate_questions(client: &ChatClient, units: &[PlanUnit]) -> Result<Vec<Question>> {
-    let silent = |_: ImportProgress| {};
-    generate_questions_with_progress(client, units, "当前材料", &silent).await
+    let silent = |_: ImportEvent| {};
+    let cancellation = ImportCancellation::default();
+    generate_questions_with_progress(client, units, "当前材料", &silent, &cancellation).await
 }
 
 pub async fn generate_questions_with_progress(
     client: &ChatClient,
     units: &[PlanUnit],
     material_title: &str,
-    progress: &ImportProgressReporter,
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
 ) -> Result<Vec<Question>> {
+    cancellation.ensure_active()?;
     if units.is_empty() {
         return Ok(Vec::new());
     }
-    progress(ImportProgress::stage(
+    progress(ImportEvent::Stage(ImportProgress::stage(
         ImportStage::Generating,
         format!(
             "正在一次性为《{material_title}》生成全部 {} 道复习基础题",
             units.len()
         ),
-    ));
+    )));
     let input = serde_json::json!({ "units": units });
+    let report_stream = |event| {
+        if let StreamEvent::Thinking(text) = event {
+            progress(ImportEvent::Thinking(text));
+        }
+    };
     let value = client
-        .chat_json_for("questions.generate", GENERATE_SYSTEM, &input.to_string())
+        .chat_json_stream_for(
+            "questions.generate",
+            GENERATE_SYSTEM,
+            &input.to_string(),
+            &report_stream,
+            Some(cancellation),
+        )
         .await?;
     let response: QuestionResponse =
         serde_json::from_value(value).map_err(|error| anyhow!("出题响应格式不对: {error}"))?;

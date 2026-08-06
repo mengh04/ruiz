@@ -4,8 +4,8 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    client::ChatClient,
-    progress::{ImportProgress, ImportProgressReporter, ImportStage},
+    client::{ChatClient, StreamEvent},
+    progress::{ImportCancellation, ImportEvent, ImportEventReporter, ImportProgress, ImportStage},
     prompts::{IMPORT_CLEAN_SYSTEM, IMPORT_ORGANIZE_SYSTEM},
     text::{normalize_source, preview},
 };
@@ -69,19 +69,32 @@ struct OrganizedMaterial {
 pub async fn import_materials(
     client: &ChatClient,
     raw: &str,
-    progress: &ImportProgressReporter,
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
 ) -> Result<Vec<ImportedMaterial>> {
+    cancellation.ensure_active()?;
     let source = normalize_source(raw)?;
-    progress(ImportProgress::stage(
+    progress(ImportEvent::Stage(ImportProgress::stage(
         ImportStage::Cleaning,
         format!(
             "正在一次性清洗整篇材料（{} 个字符），移除导航、广告和重复目录",
             source.chars().count()
         ),
-    ));
+    )));
     let input = serde_json::json!({ "raw_source": source });
+    let report_stream = |event| {
+        if let StreamEvent::Thinking(text) = event {
+            progress(ImportEvent::Thinking(text));
+        }
+    };
     let value = client
-        .chat_json_for("import.clean", IMPORT_CLEAN_SYSTEM, &input.to_string())
+        .chat_json_stream_for(
+            "import.clean",
+            IMPORT_CLEAN_SYSTEM,
+            &input.to_string(),
+            &report_stream,
+            Some(cancellation),
+        )
         .await?;
     let response: CleanResponse =
         serde_json::from_value(value).map_err(|error| anyhow!("材料清洗响应格式不对: {error}"))?;
@@ -101,13 +114,14 @@ pub async fn import_materials(
         });
     }
 
-    progress(ImportProgress::stage(
+    cancellation.ensure_active()?;
+    progress(ImportEvent::Stage(ImportProgress::stage(
         ImportStage::Organizing,
         format!(
             "正在归并 {} 个有效片段，并自动生成材料标题和摘要",
             stored.len()
         ),
-    ));
+    )));
     if stored.is_empty() {
         return Err(anyhow!("AI 没有从输入中识别出可学习的正文内容"));
     }
@@ -134,10 +148,12 @@ pub async fn import_materials(
         .collect::<Vec<_>>();
     let input = serde_json::json!({ "fragments": metadata });
     let value = client
-        .chat_json_for(
+        .chat_json_stream_for(
             "import.organize",
             IMPORT_ORGANIZE_SYSTEM,
             &input.to_string(),
+            &report_stream,
+            Some(cancellation),
         )
         .await?;
     let organized: OrganizedResponse =

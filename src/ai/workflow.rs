@@ -7,7 +7,7 @@ use super::{
     generate::{Question, generate_questions_with_progress},
     import::{ImportedMaterial, import_materials},
     plan::{MaterialPlan, PlanUnit, analyze_material_with_progress},
-    progress::{ImportProgress, ImportProgressReporter},
+    progress::{ImportCancellation, ImportEvent, ImportEventReporter, ImportProgress},
 };
 
 const MAX_QUESTIONS_PER_IMPORT: usize = 160;
@@ -23,15 +23,17 @@ pub struct PreparedMaterial {
 pub async fn prepare_import_with_progress(
     client: &ChatClient,
     raw: &str,
-    progress: &ImportProgressReporter,
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
 ) -> Result<Vec<PreparedMaterial>> {
-    progress(ImportProgress::preparing());
+    cancellation.ensure_active()?;
+    progress(ImportEvent::Stage(ImportProgress::preparing()));
     diagnostics::info(
         "import.workflow.started",
         "Smart import workflow started",
         serde_json::json!({ "raw_chars": raw.chars().count() }),
     );
-    let materials = import_materials(client, raw, progress)
+    let materials = import_materials(client, raw, progress, cancellation)
         .await
         .map_err(|error| {
             diagnostics::error(
@@ -66,21 +68,26 @@ pub async fn prepare_import_with_progress(
                 "content_chars": material.content.chars().count(),
             }),
         );
-        let mut plan =
-            analyze_material_with_progress(client, &material.title, &material.content, progress)
-                .await
-                .map_err(|error| {
-                    diagnostics::error(
-                        "import.workflow.plan_failed",
-                        "Knowledge planning failed",
-                        serde_json::json!({
-                            "material_index": index + 1,
-                            "title": material.title,
-                            "error": format!("{error:#}"),
-                        }),
-                    );
-                    error
-                })?;
+        let mut plan = analyze_material_with_progress(
+            client,
+            &material.title,
+            &material.content,
+            progress,
+            cancellation,
+        )
+        .await
+        .map_err(|error| {
+            diagnostics::error(
+                "import.workflow.plan_failed",
+                "Knowledge planning failed",
+                serde_json::json!({
+                    "material_index": index + 1,
+                    "title": material.title,
+                    "error": format!("{error:#}"),
+                }),
+            );
+            error
+        })?;
         if plan.summary.trim().is_empty() {
             plan.summary = material.summary.clone();
         }
@@ -114,24 +121,31 @@ pub async fn prepare_import_with_progress(
         planned.push((material, plan, selected));
     }
 
+    cancellation.ensure_active()?;
     let mut prepared = Vec::with_capacity(planned.len());
     for (index, (material, plan, selected)) in planned.into_iter().enumerate() {
-        let questions =
-            generate_questions_with_progress(client, &selected, &material.title, progress)
-                .await
-                .map_err(|error| {
-                    diagnostics::error(
-                        "import.workflow.questions_failed",
-                        "Question generation failed",
-                        serde_json::json!({
-                            "material_index": index + 1,
-                            "title": material.title,
-                            "unit_count": selected.len(),
-                            "error": format!("{error:#}"),
-                        }),
-                    );
-                    error
-                })?;
+        cancellation.ensure_active()?;
+        let questions = generate_questions_with_progress(
+            client,
+            &selected,
+            &material.title,
+            progress,
+            cancellation,
+        )
+        .await
+        .map_err(|error| {
+            diagnostics::error(
+                "import.workflow.questions_failed",
+                "Question generation failed",
+                serde_json::json!({
+                    "material_index": index + 1,
+                    "title": material.title,
+                    "unit_count": selected.len(),
+                    "error": format!("{error:#}"),
+                }),
+            );
+            error
+        })?;
         prepared.push(PreparedMaterial {
             material,
             plan,

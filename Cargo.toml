@@ -30,7 +30,7 @@ sqlx = { version = "0.9", default-features = false, features = [
     "sqlite",
     "chrono",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
