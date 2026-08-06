@@ -1,6 +1,7 @@
 use gpui::{Context, IntoElement, Render, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    button::Button,
     group_box::GroupBoxVariant,
     h_flex,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
@@ -210,6 +211,52 @@ impl SettingsView {
                             .child("AI 配置和笔记数据均保存在本机应用数据目录中。")
                     })
                     .keywords(["data", "local", "数据", "本地"]),
+                    SettingItem::render(|options, _window, cx| {
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .when(options.disabled, |this| this.opacity(0.5))
+                            .child(
+                                v_flex().min_w_0().gap_1().child("诊断日志").child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(
+                                            "排查导入、生成或复习异常时，可在这里打开日志目录。",
+                                        ),
+                                ),
+                            )
+                            .child(
+                                Button::new("open-diagnostics")
+                                    .icon(IconName::FolderOpen)
+                                    .label("打开日志目录")
+                                    .outline()
+                                    .disabled(options.disabled)
+                                    .on_click(|_, window, cx| {
+                                        match crate::diagnostics::open_log_directory() {
+                                            Ok(()) => {
+                                                window.push_notification("已打开诊断日志目录", cx)
+                                            }
+                                            Err(error) => {
+                                                crate::diagnostics::error(
+                                                    "diagnostics.open_failed",
+                                                    "Failed to open diagnostics directory",
+                                                    serde_json::json!({
+                                                        "error": format!("{error:#}")
+                                                    }),
+                                                );
+                                                window.push_notification(
+                                                    format!("打开日志目录失败: {error}"),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    }),
+                            )
+                    })
+                    .keywords(["logs", "diagnostics", "日志", "诊断"]),
                 ]),
             )
     }

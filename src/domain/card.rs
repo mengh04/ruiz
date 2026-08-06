@@ -17,8 +17,10 @@ pub struct Card {
     #[allow(dead_code)]
     pub due: DateTime<Utc>,
     /// 累计复习次数
+    #[allow(dead_code)]
     pub reps: u32,
     /// 累计遗忘（Again）次数
+    #[allow(dead_code)]
     pub lapses: u32,
     /// 元数据（当前 UI 未展示，保留用于数据完整性）
     #[allow(dead_code)]

@@ -11,9 +11,10 @@ use crate::domain::{
 pub async fn due_in_scope(
     pool: &SqlitePool,
     now: DateTime<Utc>,
-    group_id: Option<i64>,
+    group_ids: &[i64],
     note_id: Option<i64>,
 ) -> Result<Vec<ReviewItem>> {
+    let group_ids_json = serde_json::to_string(group_ids)?;
     let rows = sqlx::query(
         "SELECT ku.*, n.title AS note_title,
                 c.id AS seed_card_id, c.question AS fallback_question,
@@ -27,12 +28,14 @@ pub async fn due_in_scope(
              ORDER BY cku.card_id LIMIT 1
          )
          WHERE ku.generated = 1 AND ku.due <= ?1
-           AND (?2 IS NULL OR n.group_id = ?2)
+           AND (json_array_length(?2) = 0 OR n.group_id IN (
+               SELECT value FROM json_each(?2)
+           ))
            AND (?3 IS NULL OR ku.note_id = ?3)
          ORDER BY ku.due ASC, ku.id ASC",
     )
     .bind(now.to_rfc3339())
-    .bind(group_id)
+    .bind(group_ids_json)
     .bind(note_id)
     .fetch_all(pool)
     .await?;
@@ -204,6 +207,48 @@ mod tests {
     use crate::{db, domain::card::Card};
 
     #[tokio::test]
+    async fn due_scope_combines_multiple_groups() {
+        let pool = db::schema::init("sqlite::memory:")
+            .await
+            .expect("内存库建表失败");
+        let rust_group = db::groups::get_or_create(&pool, "Rust").await.unwrap();
+        let network_group = db::groups::get_or_create(&pool, "网络").await.unwrap();
+        let database_group = db::groups::get_or_create(&pool, "数据库").await.unwrap();
+
+        for (group_id, title) in [
+            (rust_group, "所有权"),
+            (network_group, "TCP"),
+            (database_group, "事务"),
+        ] {
+            let note_id = db::notes::create_in_group(&pool, group_id, title, title)
+                .await
+                .unwrap();
+            db::cards::insert(
+                &pool,
+                &Card::new(
+                    note_id,
+                    format!("{title}问题"),
+                    format!("{title}答案"),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let filtered = due_in_scope(&pool, Utc::now(), &[rust_group, database_group], None)
+            .await
+            .unwrap();
+        let mut titles = filtered
+            .into_iter()
+            .map(|item| item.note_title)
+            .collect::<Vec<_>>();
+        titles.sort();
+
+        assert_eq!(titles, vec!["事务", "所有权"]);
+    }
+
+    #[tokio::test]
     async fn prompt_snapshot_and_review_completion_are_atomic() {
         let pool = db::schema::init("sqlite::memory:")
             .await
@@ -222,7 +267,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let item = due_in_scope(&pool, Utc::now(), None, None)
+        let item = due_in_scope(&pool, Utc::now(), &[], None)
             .await
             .unwrap()
             .into_iter()

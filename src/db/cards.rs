@@ -60,6 +60,7 @@ pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
     Ok(card_id)
 }
 
+#[allow(dead_code)] // 兼容旧版卡片详情查询，当前界面以知识单元为主。
 pub async fn by_note(pool: &SqlitePool, note_id: i64) -> Result<Vec<Card>> {
     let rows = sqlx::query(
         "SELECT cards.*, card_knowledge_units.knowledge_unit_id,

@@ -61,7 +61,7 @@ where
         .border_color(colors.border)
         .child(
             h_flex()
-                .min_w_0()
+                .min_w(px(220.))
                 .flex_1()
                 .items_center()
                 .gap_3()

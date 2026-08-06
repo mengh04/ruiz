@@ -9,9 +9,11 @@ use gpui::{
 use gpui_component::Disableable as _;
 use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
 use gpui_component::theme::{ActiveTheme as _, ThemeColor};
@@ -24,7 +26,6 @@ use crate::ai::judge::Judgement;
 use crate::assets::RuizIcon;
 use crate::db;
 use crate::domain::dynamic_review::{QuestionFormat, ReviewItem, ReviewPrompt};
-use crate::domain::group::GroupSummary;
 use crate::domain::note::Note;
 use crate::domain::review::Rating;
 use crate::scheduler::Scheduler;
@@ -52,11 +53,34 @@ struct PreparedPrompt {
     adaptive_answer_formats: bool,
 }
 
+#[derive(Clone)]
+struct ReviewGroupChoice {
+    id: i64,
+    label: SharedString,
+    name: SharedString,
+}
+
+impl SearchableListItem for ReviewGroupChoice {
+    type Value = i64;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.name.to_lowercase().contains(&query.to_lowercase())
+    }
+}
+
 pub struct ReviewView {
     queue: Vec<ReviewItem>,
-    groups: Vec<GroupSummary>,
     notes: Vec<Note>,
-    selected_group_id: Option<i64>,
+    selected_group_ids: Vec<i64>,
+    group_filter: Entity<ComboboxState<SearchableVec<ReviewGroupChoice>>>,
     selected_note_id: Option<i64>,
     current: Option<ReviewItem>,
     prompt: Option<ReviewPrompt>,
@@ -84,11 +108,21 @@ impl ReviewView {
                 .multi_line(true)
                 .rows(6)
         });
+        let group_filter = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(Vec::<ReviewGroupChoice>::new()),
+                Vec::new(),
+                window,
+                cx,
+            )
+            .multiple(true)
+            .searchable(true)
+        });
         let mut view = Self {
             queue: Vec::new(),
-            groups: Vec::new(),
             notes: Vec::new(),
-            selected_group_id: None,
+            selected_group_ids: Vec::new(),
+            group_filter: group_filter.clone(),
             selected_note_id: None,
             current: None,
             prompt: None,
@@ -106,13 +140,21 @@ impl ReviewView {
             window: window_handle,
             scroll: ScrollHandle::new(),
         };
+        cx.subscribe(&group_filter, |this, _, event, cx| {
+            if let ComboboxEvent::Change(group_ids) = event {
+                this.selected_group_ids = group_ids.clone();
+                this.selected_note_id = None;
+                this.load(cx);
+            }
+        })
+        .detach();
         view.load(cx);
         view
     }
 
     pub(crate) fn load(&mut self, cx: &mut Context<Self>) {
         let pool = AppState::global(cx).pool.clone();
-        let group_id = self.selected_group_id;
+        let group_ids = self.selected_group_ids.clone();
         let note_id = self.selected_note_id;
         self.load_revision = self.load_revision.wrapping_add(1);
         let revision = self.load_revision;
@@ -134,33 +176,46 @@ impl ReviewView {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
                         let groups = db::groups::summaries(&pool, Utc::now()).await?;
                         let notes = db::notes::list(&pool).await?;
-                        let queue =
-                            db::dynamic_reviews::due_in_scope(&pool, Utc::now(), group_id, note_id)
-                                .await?;
+                        let queue = db::dynamic_reviews::due_in_scope(
+                            &pool,
+                            Utc::now(),
+                            &group_ids,
+                            note_id,
+                        )
+                        .await?;
                         anyhow::Ok((groups, notes, queue))
                     })
                     .await;
                     match result {
                         Ok((groups, notes, queue)) => {
-                            this.update(&mut cx, |this, cx| {
+                            let choices = groups
+                                .iter()
+                                .map(|summary| ReviewGroupChoice {
+                                    id: summary.group.id,
+                                    label: format!(
+                                        "{} · {} 项 · {} 到期",
+                                        summary.group.name, summary.card_count, summary.due_count
+                                    )
+                                    .into(),
+                                    name: summary.group.name.clone().into(),
+                                })
+                                .collect::<Vec<_>>();
+                            let filter_state = this.update(&mut cx, |this, cx| {
                                 if this.load_revision != revision {
-                                    return;
+                                    return None;
                                 }
-                                if this.selected_group_id.is_some_and(|id| {
-                                    !groups.iter().any(|summary| summary.group.id == id)
-                                }) {
-                                    this.selected_group_id = None;
-                                    this.selected_note_id = None;
-                                }
+                                this.selected_group_ids.retain(|id| {
+                                    groups.iter().any(|summary| summary.group.id == *id)
+                                });
                                 if this.selected_note_id.is_some_and(|id| {
                                     !notes.iter().any(|note| {
                                         note.id == id
-                                            && Some(note.group_id) == this.selected_group_id
+                                            && (this.selected_group_ids.is_empty()
+                                                || this.selected_group_ids.contains(&note.group_id))
                                     })
                                 }) {
                                     this.selected_note_id = None;
                                 }
-                                this.groups = groups;
                                 this.notes = notes;
                                 this.queue = queue;
                                 this.current = this.queue.first().cloned();
@@ -172,8 +227,22 @@ impl ReviewView {
                                     this.phase = Phase::Finished;
                                     cx.notify();
                                 }
-                            })
-                            .ok();
+                                Some((
+                                    this.group_filter.clone(),
+                                    this.selected_group_ids.clone(),
+                                    this.window,
+                                ))
+                            });
+                            if let Ok(Some((group_filter, selected, window_handle))) = filter_state
+                            {
+                                cx.update_window(window_handle, move |_, window, cx| {
+                                    group_filter.update(cx, |state, cx| {
+                                        state.set_items(SearchableVec::new(choices), window, cx);
+                                        state.set_selected_values(&selected, window, cx);
+                                    });
+                                })
+                                .ok();
+                            }
                         }
                         Err(error) => {
                             this.update(&mut cx, |this, cx| {
@@ -400,12 +469,6 @@ impl ReviewView {
         if self.current.is_some() {
             self.prepare_current(cx);
         }
-    }
-
-    fn select_group(&mut self, group_id: Option<i64>, cx: &mut Context<Self>) {
-        self.selected_group_id = group_id;
-        self.selected_note_id = None;
-        self.load(cx);
     }
 
     fn select_note(&mut self, note_id: Option<i64>, cx: &mut Context<Self>) {
@@ -672,33 +735,18 @@ impl Render for ReviewView {
                             .child("复习分组"),
                     )
                     .child(
-                        Button::new("review-all-groups")
+                        Combobox::new(&self.group_filter)
                             .small()
-                            .outline()
+                            .cleanable(true)
+                            .placeholder("全部分组")
+                            .search_placeholder("搜索分组…")
                             .disabled(busy)
-                            .selected(self.selected_group_id.is_none())
-                            .label("全部")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_group(None, cx);
-                            })),
-                    )
-                    .children(self.groups.iter().map(|summary| {
-                        let group_id = summary.group.id;
-                        Button::new(SharedString::from(format!("review-group-{group_id}")))
-                            .small()
-                            .outline()
-                            .disabled(busy)
-                            .selected(self.selected_group_id == Some(group_id))
-                            .label(format!(
-                                "{} · {} 项 · {} 到期",
-                                summary.group.name, summary.card_count, summary.due_count
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_group(Some(group_id), cx);
-                            }))
-                    })),
+                            .w(px(320.))
+                            .max_w_full(),
+                    ),
             )
-            .when_some(self.selected_group_id, |this, group_id| {
+            .when(!self.selected_group_ids.is_empty(), |this| {
+                let selected_group_ids = self.selected_group_ids.clone();
                 this.child(
                     h_flex()
                         .items_center()
@@ -725,7 +773,7 @@ impl Render for ReviewView {
                         .children(
                             self.notes
                                 .iter()
-                                .filter(move |note| note.group_id == group_id)
+                                .filter(move |note| selected_group_ids.contains(&note.group_id))
                                 .map(|note| {
                                     let note_id = note.id;
                                     Button::new(SharedString::from(format!(
@@ -829,7 +877,7 @@ impl Render for ReviewView {
                                         if prompt.generation_mode == "ai" {
                                             "AI 变式"
                                         } else {
-                                            "基础题"
+                                            "备用题"
                                         },
                                         colors.muted_foreground,
                                         colors,
@@ -1202,14 +1250,14 @@ async fn prepare_prompt(
                     );
                     (
                         item.fallback_prompt(),
-                        Some(format!("动态出题失败，已使用基础题: {error}")),
+                        Some(format!("动态出题失败，已使用备用题: {error}")),
                     )
                 }
             }
         }
         None => (
             item.fallback_prompt(),
-            Some("未配置 AI，当前使用基础题；提交判分前需要配置 AI".into()),
+            Some("未配置 AI，当前使用备用题；提交判分前需要配置 AI".into()),
         ),
     };
     let prompt_id = db::dynamic_reviews::insert_prompt(&pool, &prompt).await?;

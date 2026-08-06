@@ -27,7 +27,7 @@ impl ImportStage {
             Self::Organizing => "归并并命名材料",
             Self::Extracting => "提取知识单元",
             Self::Reconciling => "整理知识蓝图",
-            Self::Generating => "生成复习基础题",
+            Self::Generating => "准备复习备用题",
             Self::Saving => "保存到资料库",
         }
     }

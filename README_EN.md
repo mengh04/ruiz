@@ -2,7 +2,7 @@
 
 # Ruiz
 
-An AI-powered learning & memory desktop app built on [gpui](https://github.com/zed-industries/zed): hand any learning material to the AI for smart import — it automatically organizes it into a knowledge blueprint and generates review cards, then schedules reviews with the [FSRS](https://github.com/open-spaced-repetition/fsrs4anki/wiki) spaced-repetition algorithm to make memorization far more effective.
+An AI-powered learning & memory desktop app built on [gpui](https://github.com/zed-industries/zed): hand any learning material to the AI for smart import — it automatically organizes it into a knowledge blueprint, then schedules knowledge-unit reviews with the [FSRS](https://github.com/open-spaced-repetition/fsrs4anki/wiki) spaced-repetition algorithm to make memorization far more effective.
 
 > Work in progress (WIP) — features and UI are still iterating quickly.
 
@@ -10,9 +10,9 @@ An AI-powered learning & memory desktop app built on [gpui](https://github.com/z
 
 - **AI Smart Import**: paste or import learning material, and the AI runs the full pipeline — "clean web noise → merge & name materials → extract knowledge units → organize knowledge blueprint → generate foundational review questions" — with **real-time streaming stage progress**, cancellable at any time without writing half-baked data.
 - **Knowledge Blueprint**: imported materials are parsed into knowledge units (with topics, learning objectives, importance, cognitive actions, etc.), providing a structured basis for review generation.
-- **Card Generation Scope**: generate foundational review questions in three scopes — "concise / AI-suggested / comprehensive".
+- **Knowledge-Unit Driven**: review centers on AI-recommended knowledge units; static prompts remain only as an internal fallback when dynamic generation fails.
 - **Dynamic Review**: during review, the AI adaptively generates dynamic question types — **multiple choice, fill-in-the-blank, applied questions** — based on knowledge-unit mastery; you can also disable adaptivity and use free-form short-answer questions uniformly.
-- **FSRS Spaced Repetition**: every card's review date is scheduled by the FSRS scheduler (stability / difficulty / due date) for a scientific review rhythm.
+- **FSRS Spaced Repetition**: every knowledge unit's review date is scheduled by the FSRS scheduler (stability / difficulty / due date) for a scientific review rhythm.
 - **Study Groups**: organize notes with study groups and move notes between groups.
 - **Local Storage**: all data is stored in a local SQLite database — review works fully offline.
 
@@ -44,7 +44,7 @@ cargo run --release
 
 1. Launch the app and enter your DeepSeek API Key on the **Settings** page (defaults to the `deepseek-v4-flash` model; you can also switch to `deepseek-v4-pro`).
 2. Paste or import a learning material on the **Notes** page.
-3. Click import and the AI smart-import pipeline starts: expand the task panel to watch stage progress — "clean, merge, extract, organize blueprint, generate cards" — in real time.
+3. Click import and the AI smart-import pipeline starts: expand the task panel to watch stage progress — "clean, merge, extract, organize blueprint, prepare review content" — in real time.
 4. Once the pipeline finishes, the organized material and generated foundational review questions appear in your library.
 5. Review on the **Review** page according to the FSRS schedule — the AI generates questions dynamically based on your mastery.
 
@@ -63,7 +63,7 @@ Falls back to `./ruiz-data` in the current directory if none are available.
 
 - [x] AI smart-import pipeline (SSE streaming progress, stage display, cancellable)
 - [x] Study groups & note management
-- [x] Card generation scope (concise / AI-suggested / comprehensive)
+- [x] Dynamic review driven by AI-recommended knowledge units
 - [x] Dynamic review: adaptive AI question generation (multiple choice / fill-in-the-blank / applied)
 - [ ] Show request IDs, model output deltas and cumulative elapsed time in the task panel
 - [ ] Unified redaction of sensitive fields in logs and streaming views
