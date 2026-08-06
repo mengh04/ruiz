@@ -27,7 +27,7 @@ pub async fn due_in_scope(
              WHERE cku.knowledge_unit_id = ku.id
              ORDER BY cku.card_id LIMIT 1
          )
-         WHERE ku.generated = 1 AND ku.due <= ?1
+         WHERE ku.generated = 1 AND ku.introduced_at IS NOT NULL AND ku.due <= ?1
            AND (json_array_length(?2) = 0 OR n.group_id IN (
                SELECT value FROM json_each(?2)
            ))

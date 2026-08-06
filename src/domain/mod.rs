@@ -5,5 +5,6 @@ pub mod card;
 pub mod dynamic_review;
 pub mod group;
 pub mod knowledge;
+pub mod learning;
 pub mod note;
 pub mod review;

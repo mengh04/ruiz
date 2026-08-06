@@ -35,10 +35,10 @@ pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
             (note_id, local_id, topic, objective, unit_type, importance, stage,
              cognitive_action, required_points_json, claim_ids_json, evidence_json,
              reason, quick, recommended, generated, stability, difficulty, due,
-             reps, lapses, last_review, prerequisite_ids_json, position)
+             reps, lapses, last_review, prerequisite_ids_json, position, introduced_at)
          VALUES (?1, ?2, '旧版卡片', ?3, 'legacy', 'core', 'foundation',
                  'recall', ?4, '[]', ?5, '由旧版卡片迁移', 1, 1, 1,
-                 NULL, NULL, ?6, 0, 0, NULL, '[]', ?7)
+                 NULL, NULL, ?6, 0, 0, NULL, '[]', ?7, ?8)
          RETURNING id",
     )
     .bind(card.note_id)
@@ -48,6 +48,7 @@ pub async fn insert(pool: &SqlitePool, card: &Card) -> Result<i64> {
     .bind(evidence)
     .bind(card.due.to_rfc3339())
     .bind(card_id)
+    .bind(&now)
     .fetch_one(&mut *transaction)
     .await?
     .get("id");

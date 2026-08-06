@@ -29,6 +29,16 @@ impl QuestionFormat {
             Self::Application => "application",
         }
     }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "choice" => Ok(Self::Choice),
+            "fill_blank" => Ok(Self::FillBlank),
+            "short_answer" => Ok(Self::ShortAnswer),
+            "application" => Ok(Self::Application),
+            _ => Err(anyhow::anyhow!("未知题型: {value}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

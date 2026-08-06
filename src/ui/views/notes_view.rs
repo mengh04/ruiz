@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, Context, Entity, IntoElement, MouseButton, NavigationDirection, Render,
-    ScrollHandle, SharedString, Window, div, point, prelude::*, px, relative,
+    ScrollHandle, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point,
+    prelude::*, px, relative, size,
 };
 use gpui_component::Disableable as _;
 use gpui_component::alert::Alert;
@@ -23,8 +24,8 @@ use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::theme::ActiveTheme as _;
 use gpui_component::{
-    Icon, IconName, IndexPath, Placement, Root, Sizable as _, StyledExt as _, WindowExt as _,
-    h_flex, v_flex,
+    Icon, IconName, IndexPath, Placement, Root, Sizable as _, StyledExt as _, TitleBar,
+    WindowExt as _, h_flex, v_flex,
 };
 
 use crate::ai::progress::{ImportCancellation, ImportEvent, ImportProgress, ImportStage};
@@ -35,6 +36,7 @@ use crate::domain::knowledge::{KnowledgeUnit, MaterialAnalysis};
 use crate::domain::note::Note;
 use crate::state::AppState;
 use crate::ui::components::{empty_state, page_header};
+use crate::ui::views::learning_view::LearningView;
 
 pub struct NotesView {
     notes: Vec<Note>,
@@ -49,6 +51,8 @@ pub struct NotesView {
     group_name_input: Entity<InputState>,
     analysis: Option<MaterialAnalysis>,
     units: Vec<KnowledgeUnit>,
+    learning_session_exists: bool,
+    can_resume_learning: bool,
     notes_loading: bool,
     detail_loading: bool,
     importing: bool,
@@ -63,6 +67,7 @@ pub struct NotesView {
     import_cancelling: bool,
     generating: bool,
     deleting_note_id: Option<i64>,
+    resetting_learning: bool,
     message: Option<Message>,
     /// 窗口句柄（清空输入框等窗口操作需要）
     window: AnyWindowHandle,
@@ -149,6 +154,8 @@ impl NotesView {
             group_name_input,
             analysis: None,
             units: Vec::new(),
+            learning_session_exists: false,
+            can_resume_learning: false,
             notes_loading: true,
             detail_loading: false,
             importing: false,
@@ -163,6 +170,7 @@ impl NotesView {
             import_cancelling: false,
             generating: false,
             deleting_note_id: None,
+            resetting_learning: false,
             message: None,
             window: window_handle,
             notes_scroll: ScrollHandle::new(),
@@ -352,15 +360,19 @@ impl NotesView {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
                         let analysis = db::knowledge::analysis_by_note(&pool, note_id).await?;
                         let units = db::knowledge::units_by_note(&pool, note_id).await?;
-                        anyhow::Ok((analysis, units))
+                        let learning_state =
+                            db::learning::learning_progress_state(&pool, note_id).await?;
+                        anyhow::Ok((analysis, units, learning_state))
                     })
                     .await;
                     match result {
-                        Ok((analysis, units)) => {
+                        Ok((analysis, units, (session_exists, can_resume))) => {
                             this.update(&mut cx, |this, cx| {
                                 if this.page.note_id() == Some(note_id) {
                                     this.analysis = analysis;
                                     this.units = units;
+                                    this.learning_session_exists = session_exists;
+                                    this.can_resume_learning = can_resume;
                                     this.detail_loading = false;
                                 }
                                 cx.notify();
@@ -642,6 +654,8 @@ impl NotesView {
         self.page = NotesPage::Detail(id);
         self.analysis = None;
         self.units.clear();
+        self.learning_session_exists = false;
+        self.can_resume_learning = false;
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_detail(cx);
         cx.notify();
@@ -664,7 +678,128 @@ impl NotesView {
         self.detail_loading = false;
         self.analysis = None;
         self.units.clear();
+        self.learning_session_exists = false;
+        self.can_resume_learning = false;
         cx.notify();
+    }
+
+    fn open_learning(&mut self, note_id: i64, cx: &mut Context<Self>) {
+        let Some(note) = self.notes.iter().find(|note| note.id == note_id).cloned() else {
+            return;
+        };
+        if self.units.is_empty() {
+            self.message = Some(Message::Warning("请先建立知识蓝图，再开始引导学习".into()));
+            cx.notify();
+            return;
+        }
+        let analysis = self.analysis.clone();
+        let units = self.units.clone();
+        self.learning_session_exists = true;
+        self.can_resume_learning = true;
+        cx.notify();
+        let bounds = WindowBounds::centered(size(px(1180.), px(780.)), cx);
+        cx.spawn(async move |_, cx| {
+            let result = cx.open_window(
+                WindowOptions {
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(format!("引导学习 · {}", note.title).into()),
+                        ..TitleBar::title_bar_options()
+                    }),
+                    window_bounds: Some(bounds),
+                    window_min_size: Some(size(px(680.), px(560.))),
+                    #[cfg(target_os = "linux")]
+                    window_background: gpui::WindowBackgroundAppearance::Transparent,
+                    #[cfg(target_os = "linux")]
+                    window_decorations: Some(gpui::WindowDecorations::Client),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let learning =
+                        cx.new(|cx| LearningView::new(note, analysis, units, window, cx));
+                    cx.new(|cx| Root::new(learning, window, cx))
+                },
+            );
+            if let Err(error) = result {
+                crate::diagnostics::error(
+                    "learning.window.open_failed",
+                    "Failed to open guided learning window",
+                    serde_json::json!({ "error": error.to_string() }),
+                );
+            }
+        })
+        .detach();
+    }
+
+    fn confirm_reset_learning(
+        &mut self,
+        note_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("重置学习进度？")
+                .description(
+                    "将清除这篇笔记的学习步骤进度和首次学习答题记录，并从第一步重新开始。学习路线、题目缓存和正式复习记录会保留。",
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("重置")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.reset_learning(note_id, cx));
+                        true
+                    }
+                })
+                .on_close({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |_, cx| cx.notify());
+                    }
+                })
+        });
+        cx.notify();
+    }
+
+    fn reset_learning(&mut self, note_id: i64, cx: &mut Context<Self>) {
+        if self.resetting_learning {
+            return;
+        }
+        let pool = AppState::global(cx).pool.clone();
+        self.resetting_learning = true;
+        self.message = None;
+        cx.notify();
+        cx.spawn(
+            move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
+                let mut cx = (*cx).clone();
+                async move {
+                    let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
+                        db::learning::reset_learning_progress(&pool, note_id).await
+                    })
+                    .await;
+                    this.update(&mut cx, |this, cx| {
+                        this.resetting_learning = false;
+                        this.message = Some(match result {
+                            Ok(_) => {
+                                this.learning_session_exists = false;
+                                this.can_resume_learning = false;
+                                Message::Success("学习进度已重置，下次将从第一步开始".into())
+                            }
+                            Err(error) => Message::Error(format!("重置学习进度失败: {error:#}")),
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
     }
 
     fn navigate_back(&mut self, cx: &mut Context<Self>) {
@@ -2112,6 +2247,38 @@ impl Render for NotesView {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
+                                    .child(
+                                        Button::new("start-guided-learning")
+                                            .small()
+                                            .icon(RuizIcon::GraduationCap)
+                                            .label(if self.can_resume_learning {
+                                                "继续学习"
+                                            } else {
+                                                "开始学习"
+                                            })
+                                            .primary()
+                                            .disabled(self.detail_loading || self.units.is_empty())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_learning(id, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("reset-guided-learning")
+                                            .small()
+                                            .icon(IconName::Undo2)
+                                            .label("重置学习进度")
+                                            .tooltip("清除学习步骤与答题进度，从第一步重新开始")
+                                            .outline()
+                                            .loading(self.resetting_learning)
+                                            .disabled(
+                                                self.detail_loading
+                                                    || self.resetting_learning
+                                                    || !self.learning_session_exists,
+                                            )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.confirm_reset_learning(id, window, cx);
+                                            })),
+                                    )
                                     .child(
                                         Button::new("read-full-note")
                                             .small()

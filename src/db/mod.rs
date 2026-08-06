@@ -6,6 +6,7 @@ pub mod cards;
 pub mod dynamic_reviews;
 pub mod groups;
 pub mod knowledge;
+pub mod learning;
 pub mod notes;
 pub mod reviews;
 pub mod schema;

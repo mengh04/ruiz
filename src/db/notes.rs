@@ -76,6 +76,61 @@ pub async fn move_to_group(pool: &SqlitePool, id: i64, group_id: i64) -> Result<
 pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
     // 显式清理关联数据，避免依赖 SQLite 每条连接的 foreign_keys PRAGMA 状态。
     let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM learning_attempts WHERE session_id IN (
+             SELECT ls.id FROM learning_sessions ls JOIN learning_plans lp ON lp.id = ls.plan_id
+             WHERE lp.note_id = ?1
+         )",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM learning_step_progress WHERE session_id IN (
+             SELECT ls.id FROM learning_sessions ls JOIN learning_plans lp ON lp.id = ls.plan_id
+             WHERE lp.note_id = ?1
+         )",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM learning_sessions WHERE plan_id IN (SELECT id FROM learning_plans WHERE note_id = ?1)",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM learning_prompts WHERE learning_step_id IN (
+             SELECT ls.id FROM learning_steps ls JOIN learning_plans lp ON lp.id = ls.plan_id
+             WHERE lp.note_id = ?1
+         )",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM learning_steps WHERE plan_id IN (SELECT id FROM learning_plans WHERE note_id = ?1)",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM learning_plans WHERE note_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "DELETE FROM knowledge_unit_sources WHERE content_block_id IN (
+             SELECT id FROM content_blocks WHERE note_id = ?1
+         )",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM content_blocks WHERE note_id = ?1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
     sqlx::query("DELETE FROM reviews WHERE card_id IN (SELECT id FROM cards WHERE note_id = ?1)")
         .bind(id)
         .execute(&mut *transaction)

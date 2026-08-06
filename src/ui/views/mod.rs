@@ -1,3 +1,4 @@
+pub mod learning_view;
 pub mod main_view;
 pub mod notes_view;
 pub mod review_view;

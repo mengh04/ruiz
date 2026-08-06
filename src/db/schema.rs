@@ -136,6 +136,117 @@ CREATE TABLE IF NOT EXISTS reviews (
     reviewed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_card ON reviews(card_id);
+
+CREATE TABLE IF NOT EXISTS content_blocks (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id           INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    content_hash      TEXT NOT NULL,
+    local_id          TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    heading_path_json TEXT NOT NULL DEFAULT '[]',
+    source_start      INTEGER NOT NULL,
+    source_end        INTEGER NOT NULL,
+    source_text       TEXT NOT NULL,
+    plain_text        TEXT NOT NULL,
+    position          INTEGER NOT NULL,
+    UNIQUE(note_id, content_hash, local_id)
+);
+CREATE INDEX IF NOT EXISTS idx_content_blocks_note
+ON content_blocks(note_id, content_hash, position);
+
+CREATE TABLE IF NOT EXISTS knowledge_unit_sources (
+    knowledge_unit_id INTEGER NOT NULL REFERENCES knowledge_units(id) ON DELETE CASCADE,
+    content_block_id  INTEGER NOT NULL REFERENCES content_blocks(id) ON DELETE CASCADE,
+    relevance         TEXT NOT NULL,
+    position          INTEGER NOT NULL,
+    PRIMARY KEY (knowledge_unit_id, content_block_id)
+);
+
+CREATE TABLE IF NOT EXISTS learning_plans (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id           INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    content_hash      TEXT NOT NULL,
+    plan_version      INTEGER NOT NULL,
+    summary           TEXT NOT NULL,
+    estimated_minutes INTEGER NOT NULL,
+    generation_mode   TEXT NOT NULL,
+    topics_json       TEXT NOT NULL DEFAULT '[]',
+    created_at        TEXT NOT NULL,
+    UNIQUE(note_id, content_hash, plan_version)
+);
+
+CREATE TABLE IF NOT EXISTS learning_steps (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id              INTEGER NOT NULL REFERENCES learning_plans(id) ON DELETE CASCADE,
+    local_id             TEXT NOT NULL,
+    topic_id             TEXT NOT NULL,
+    topic_title          TEXT NOT NULL,
+    kind                 TEXT NOT NULL,
+    block_ids_json       TEXT NOT NULL DEFAULT '[]',
+    unit_ids_json        TEXT NOT NULL DEFAULT '[]',
+    source_step_ids_json TEXT NOT NULL DEFAULT '[]',
+    intent               TEXT,
+    question_format      TEXT,
+    reason               TEXT,
+    position             INTEGER NOT NULL,
+    UNIQUE(plan_id, local_id)
+);
+
+CREATE TABLE IF NOT EXISTS learning_prompts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    learning_step_id      INTEGER NOT NULL REFERENCES learning_steps(id) ON DELETE CASCADE,
+    position              INTEGER NOT NULL DEFAULT 0,
+    unit_ids_json         TEXT NOT NULL DEFAULT '[]',
+    question_type         TEXT NOT NULL,
+    question              TEXT NOT NULL,
+    options_json          TEXT NOT NULL DEFAULT '[]',
+    standard_answer       TEXT NOT NULL,
+    required_points_json  TEXT NOT NULL DEFAULT '[]',
+    source_block_ids_json TEXT NOT NULL DEFAULT '[]',
+    generation_mode       TEXT NOT NULL,
+    created_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS learning_sessions (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id            INTEGER NOT NULL REFERENCES learning_plans(id) ON DELETE CASCADE,
+    status             TEXT NOT NULL,
+    current_step_index INTEGER NOT NULL DEFAULT 0,
+    started_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    completed_at       TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_sessions_active_plan
+ON learning_sessions(plan_id)
+WHERE status IN ('not_started', 'active', 'paused');
+
+CREATE TABLE IF NOT EXISTS learning_step_progress (
+    session_id       INTEGER NOT NULL REFERENCES learning_sessions(id) ON DELETE CASCADE,
+    learning_step_id INTEGER NOT NULL REFERENCES learning_steps(id) ON DELETE CASCADE,
+    status           TEXT NOT NULL,
+    first_result     TEXT,
+    assisted         INTEGER NOT NULL DEFAULT 0,
+    runtime_json     TEXT NOT NULL DEFAULT '{}',
+    started_at       TEXT,
+    completed_at     TEXT,
+    PRIMARY KEY (session_id, learning_step_id)
+);
+
+CREATE TABLE IF NOT EXISTS learning_attempts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL REFERENCES learning_sessions(id) ON DELETE CASCADE,
+    learning_step_id INTEGER NOT NULL REFERENCES learning_steps(id) ON DELETE CASCADE,
+    prompt_id        INTEGER REFERENCES learning_prompts(id) ON DELETE SET NULL,
+    unit_ids_json    TEXT NOT NULL DEFAULT '[]',
+    attempt_number   INTEGER NOT NULL,
+    user_answer      TEXT NOT NULL,
+    result           TEXT NOT NULL,
+    score            INTEGER,
+    feedback         TEXT NOT NULL,
+    assisted         INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL
+);
+
 "#;
 
 /// 初始化数据库并建表。`db_path` 形如 `sqlite://path/to/ruiz.db?mode=rwc`。
@@ -144,7 +255,73 @@ pub async fn init(db_path: &str) -> Result<SqlitePool> {
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     migrate_groups(&pool).await?;
     migrate_dynamic_review(&pool).await?;
+    migrate_guided_learning(&pool).await?;
     Ok(pool)
+}
+
+async fn migrate_guided_learning(pool: &SqlitePool) -> Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(knowledge_units)")
+        .fetch_all(pool)
+        .await?;
+    if !columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "introduced_at")
+    {
+        sqlx::query("ALTER TABLE knowledge_units ADD COLUMN introduced_at TEXT")
+            .execute(pool)
+            .await?;
+        // Upgrading users keep their existing review queue; only future imports start gated.
+        sqlx::query(
+            "UPDATE knowledge_units SET introduced_at = COALESCE(last_review, due, datetime('now'))
+             WHERE generated = 1",
+        )
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_units_introduced_due
+         ON knowledge_units(generated, introduced_at, due)",
+    )
+    .execute(pool)
+    .await?;
+    let prompt_columns = sqlx::query("PRAGMA table_info(learning_prompts)")
+        .fetch_all(pool)
+        .await?;
+    if !prompt_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "position")
+    {
+        sqlx::query("ALTER TABLE learning_prompts ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
+    if !prompt_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "unit_ids_json")
+    {
+        sqlx::query(
+            "ALTER TABLE learning_prompts ADD COLUMN unit_ids_json TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(pool)
+        .await?;
+    }
+    // Prompt set v3 adds per-question coverage and replaces mechanically rotated questions.
+    sqlx::query(
+        "DELETE FROM learning_attempts
+         WHERE prompt_id IN (
+             SELECT id FROM learning_prompts
+             WHERE generation_mode NOT IN ('ai_v3', 'fallback_v3')
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM learning_prompts
+         WHERE generation_mode NOT IN ('ai_v3', 'fallback_v3')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn migrate_groups(pool: &SqlitePool) -> Result<()> {
@@ -336,8 +513,8 @@ mod tests {
         plan::{MaterialPlan, PlanClaim, PlanUnit},
         workflow::PreparedMaterial,
     };
-    use crate::domain::card::Card;
     use crate::db;
+    use crate::domain::card::Card;
 
     #[tokio::test]
     async fn schema_and_crud_roundtrip() {
@@ -428,13 +605,15 @@ mod tests {
             .unwrap();
         assert_eq!(analysis.recommended_count, 1);
 
-        let imported = db::knowledge::save_import(&pool, "智能导入", std::slice::from_ref(&prepared))
-            .await
-            .unwrap();
+        let imported =
+            db::knowledge::save_import(&pool, "智能导入", std::slice::from_ref(&prepared))
+                .await
+                .unwrap();
         assert_eq!(imported.note_ids.len(), 1);
-        let duplicate = db::knowledge::save_import(&pool, "智能导入", std::slice::from_ref(&prepared))
-            .await
-            .expect_err("同一分组不应重复导入相同原始材料");
+        let duplicate =
+            db::knowledge::save_import(&pool, "智能导入", std::slice::from_ref(&prepared))
+                .await
+                .expect_err("同一分组不应重复导入相同原始材料");
         assert!(duplicate.to_string().contains("相同原始材料"));
 
         // 删除笔记时同时清理卡片和复习记录。
