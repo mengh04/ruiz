@@ -34,7 +34,8 @@ use crate::state::AppState;
 use crate::ui::components::{empty_state, page_header};
 
 enum Phase {
-    Loading,
+    LoadingQueue,
+    PreparingQuestion,
     Ready,
     Answering,
     Judging,
@@ -93,6 +94,7 @@ pub struct ReviewView {
     preparing_unit_id: Option<i64>,
     prefetching_unit_id: Option<i64>,
     load_revision: u64,
+    queue_loading: bool,
     show_source: bool,
     submitted_answer: String,
     window: AnyWindowHandle,
@@ -127,7 +129,7 @@ impl ReviewView {
             current: None,
             prompt: None,
             selected_option: None,
-            phase: Phase::Loading,
+            phase: Phase::LoadingQueue,
             answer,
             error: None,
             generation_notice: None,
@@ -135,6 +137,7 @@ impl ReviewView {
             preparing_unit_id: None,
             prefetching_unit_id: None,
             load_revision: 0,
+            queue_loading: false,
             show_source: false,
             submitted_answer: String::new(),
             window: window_handle,
@@ -153,15 +156,27 @@ impl ReviewView {
     }
 
     pub(crate) fn load(&mut self, cx: &mut Context<Self>) {
+        self.load_queue(true, cx);
+    }
+
+    fn refresh_queue(&mut self, cx: &mut Context<Self>) {
+        let show_loading = !matches!(self.phase, Phase::Ready | Phase::Finished);
+        self.load_queue(show_loading, cx);
+    }
+
+    fn load_queue(&mut self, show_loading: bool, cx: &mut Context<Self>) {
         let pool = AppState::global(cx).pool.clone();
         let group_ids = self.selected_group_ids.clone();
         let note_id = self.selected_note_id;
         self.load_revision = self.load_revision.wrapping_add(1);
         let revision = self.load_revision;
-        self.phase = Phase::Loading;
-        self.queue.clear();
-        self.current = None;
-        self.prompt = None;
+        self.queue_loading = true;
+        if show_loading {
+            self.phase = Phase::LoadingQueue;
+            self.queue.clear();
+            self.current = None;
+            self.prompt = None;
+        }
         self.prefetched = None;
         self.preparing_unit_id = None;
         self.prefetching_unit_id = None;
@@ -219,6 +234,7 @@ impl ReviewView {
                                 this.notes = notes;
                                 this.queue = queue;
                                 this.current = this.queue.first().cloned();
+                                this.queue_loading = false;
                                 if this.current.is_some() {
                                     // 先停在 Ready：等用户点击「开始复习」才调用 AI 生成题面。
                                     this.phase = Phase::Ready;
@@ -250,6 +266,7 @@ impl ReviewView {
                                     return;
                                 }
                                 this.error = Some(format!("加载复习队列失败: {error}"));
+                                this.queue_loading = false;
                                 this.phase = Phase::Finished;
                                 cx.notify();
                             })
@@ -292,7 +309,7 @@ impl ReviewView {
             self.prefetched = None;
         }
         if self.prefetching_unit_id == Some(item.unit_id) {
-            self.phase = Phase::Loading;
+            self.phase = Phase::PreparingQuestion;
             cx.notify();
             return;
         }
@@ -301,7 +318,7 @@ impl ReviewView {
         let revision = self.load_revision;
         let unit_id = item.unit_id;
         self.preparing_unit_id = Some(unit_id);
-        self.phase = Phase::Loading;
+        self.phase = Phase::PreparingQuestion;
         self.prompt = None;
         self.selected_option = None;
         self.show_source = false;
@@ -693,10 +710,11 @@ impl Render for ReviewView {
         let warning_color = cx.theme().yellow;
         let error_color = cx.theme().red;
         let compact = window.viewport_size().width.as_f32() < 900.;
-        let busy = matches!(
-            self.phase,
-            Phase::Loading | Phase::Judging | Phase::Scheduling
-        );
+        let busy = self.queue_loading
+            || matches!(
+                self.phase,
+                Phase::LoadingQueue | Phase::PreparingQuestion | Phase::Judging | Phase::Scheduling
+            );
 
         let header = page_header(
             RuizIcon::BrainCircuit,
@@ -707,9 +725,9 @@ impl Render for ReviewView {
                     .icon(IconName::Redo2)
                     .label("刷新队列")
                     .outline()
-                    .loading(matches!(self.phase, Phase::Loading))
+                    .loading(self.queue_loading)
                     .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_queue(cx)))
                     .into_any_element(),
             ),
             cx,
@@ -793,7 +811,13 @@ impl Render for ReviewView {
             });
 
         let body = match &self.phase {
-            Phase::Loading => loading_state(colors).into_any_element(),
+            Phase::LoadingQueue => process_state(
+                "正在加载复习队列",
+                "正在读取当前范围内到期的知识单元和复习状态。",
+                colors,
+            )
+            .into_any_element(),
+            Phase::PreparingQuestion => question_loading_state(colors).into_any_element(),
             Phase::Ready => empty_state(
                 IconName::Play,
                 "准备好开始复习了吗？",
@@ -806,6 +830,7 @@ impl Render for ReviewView {
                         .icon(IconName::Play)
                         .label("开始复习")
                         .primary()
+                        .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| this.start(cx)))
                         .into_any_element(),
                 ),
@@ -821,7 +846,9 @@ impl Render for ReviewView {
                         .icon(IconName::Redo2)
                         .label("刷新队列")
                         .primary()
-                        .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
+                        .loading(self.queue_loading)
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_queue(cx)))
                         .into_any_element(),
                 ),
                 cx,
@@ -1269,7 +1296,7 @@ async fn prepare_prompt(
     })
 }
 
-fn loading_state(colors: ThemeColor) -> impl IntoElement {
+fn question_loading_state(colors: ThemeColor) -> impl IntoElement {
     v_flex()
         .size_full()
         .items_center()
