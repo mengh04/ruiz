@@ -380,7 +380,6 @@ impl LearningView {
                                     Some(prompt) => prompt,
                                     None => {
                                         db::learning::fallback_prompt(
-                                            &pool,
                                             &step,
                                             &units,
                                             target_unit_ids,

@@ -28,7 +28,9 @@ use gpui_component::{
     h_flex, v_flex,
 };
 
-use crate::ai::progress::{ImportCancellation, ImportEvent, ImportProgress, ImportStage};
+use crate::ai::progress::{
+    ImportCancellation, ImportEvent, ImportProgress, ImportStage, ImportStats,
+};
 use crate::assets::RuizIcon;
 use crate::db;
 use crate::domain::dynamic_review::{ProficiencyLevel, ReviewState};
@@ -61,11 +63,9 @@ pub struct NotesView {
     detail_loading: bool,
     importing: bool,
     import_progress: Option<ImportProgress>,
-    import_thinking: String,
-    import_thinking_chars: usize,
-    import_answer_preview: String,
-    import_answer_chars: usize,
-    import_thinking_expanded: bool,
+    import_activity: String,
+    import_recent_items: Vec<String>,
+    import_stats: ImportStats,
     import_started_at: Option<Instant>,
     import_cancellation: Option<ImportCancellation>,
     import_cancelling: bool,
@@ -161,11 +161,9 @@ impl NotesView {
             detail_loading: false,
             importing: false,
             import_progress: None,
-            import_thinking: String::new(),
-            import_thinking_chars: 0,
-            import_answer_preview: String::new(),
-            import_answer_chars: 0,
-            import_thinking_expanded: false,
+            import_activity: String::new(),
+            import_recent_items: Vec::new(),
+            import_stats: ImportStats::default(),
             import_started_at: None,
             import_cancellation: None,
             import_cancelling: false,
@@ -191,45 +189,6 @@ impl NotesView {
 
     fn notify(&self, notification: Notification, cx: &mut Context<Self>) {
         notifications::push(self.window, notification, cx);
-    }
-
-    fn append_import_thinking(&mut self, text: &str) {
-        const MAX_VISIBLE_CHARS: usize = 12_000;
-
-        let incoming_chars = text.chars().count();
-        self.import_thinking_chars += incoming_chars;
-        if incoming_chars >= MAX_VISIBLE_CHARS {
-            self.import_thinking = text
-                .chars()
-                .skip(incoming_chars - MAX_VISIBLE_CHARS)
-                .collect();
-            return;
-        }
-        self.import_thinking.push_str(text);
-        let visible_chars = self.import_thinking.chars().count();
-        if visible_chars > MAX_VISIBLE_CHARS {
-            self.import_thinking = self
-                .import_thinking
-                .chars()
-                .skip(visible_chars - MAX_VISIBLE_CHARS)
-                .collect();
-        }
-    }
-
-    fn append_import_answer(&mut self, text: &str) {
-        const MAX_VISIBLE_CHARS: usize = 8_000;
-
-        let incoming_chars = text.chars().count();
-        self.import_answer_chars += incoming_chars;
-        self.import_answer_preview.push_str(text);
-        let visible_chars = self.import_answer_preview.chars().count();
-        if visible_chars > MAX_VISIBLE_CHARS {
-            self.import_answer_preview = self
-                .import_answer_preview
-                .chars()
-                .skip(visible_chars - MAX_VISIBLE_CHARS)
-                .collect();
-        }
     }
 
     fn cancel_import(&mut self, cx: &mut Context<Self>) {
@@ -435,11 +394,9 @@ impl NotesView {
         self.importing = true;
         self.import_group_selection_changed = false;
         self.import_progress = Some(ImportProgress::preparing());
-        self.import_thinking.clear();
-        self.import_thinking_chars = 0;
-        self.import_answer_preview.clear();
-        self.import_answer_chars = 0;
-        self.import_thinking_expanded = false;
+        self.import_activity = "任务已启动，正在准备输入".into();
+        self.import_recent_items.clear();
+        self.import_stats = ImportStats::default();
         self.import_started_at = Some(Instant::now());
         self.import_cancellation = Some(cancellation.clone());
         self.import_cancelling = false;
@@ -447,67 +404,62 @@ impl NotesView {
         let content_input = self.content.clone();
         let source_path_input = self.source_path_input.clone();
         let window_handle = self.window;
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<ImportEvent>();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ImportEvent>(256);
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
                 let mut cx = (*cx).clone();
                 async move {
                     let mut pending_stage = None;
-                    let mut pending_thinking = String::new();
-                    let mut pending_answer = String::new();
+                    let mut pending_items = Vec::new();
+                    let mut pending_notices = Vec::new();
+                    let mut pending_stats = None;
                     let mut last_update = Instant::now()
                         .checked_sub(Duration::from_millis(100))
                         .unwrap_or_else(Instant::now);
                     while let Some(event) = progress_rx.recv().await {
                         match event {
                             ImportEvent::Stage(progress) => pending_stage = Some(progress),
-                            ImportEvent::Thinking(text) => pending_thinking.push_str(&text),
-                            ImportEvent::Answer(text) => pending_answer.push_str(&text),
+                            ImportEvent::ItemCompleted { label, summary, .. } => {
+                                pending_items.push(format!("{label}：{summary}"));
+                            }
+                            ImportEvent::Notice(text) => pending_notices.push(text),
+                            ImportEvent::Stats(stats) => pending_stats = Some(stats),
                         }
                         let should_update = pending_stage.is_some()
                             || last_update.elapsed() >= Duration::from_millis(100)
-                            || pending_thinking.len() >= 512;
+                            || !pending_items.is_empty()
+                            || !pending_notices.is_empty()
+                            || pending_stats.is_some();
                         if !should_update {
                             continue;
                         }
                         let stage = pending_stage.take();
-                        let thinking = std::mem::take(&mut pending_thinking);
-                        let answer = std::mem::take(&mut pending_answer);
+                        let items = std::mem::take(&mut pending_items);
+                        let notices = std::mem::take(&mut pending_notices);
+                        let stats = pending_stats.take();
                         this.update(&mut cx, |this, cx| {
                             if this.importing {
                                 if let Some(stage) = stage {
+                                    this.import_activity = stage.detail.clone();
                                     this.import_progress = Some(stage);
                                 }
-                                if !thinking.is_empty() {
-                                    this.append_import_thinking(&thinking);
+                                if let Some(stats) = stats {
+                                    this.import_stats = stats;
                                 }
-                                if !answer.is_empty() {
-                                    this.append_import_answer(&answer);
+                                for item in items {
+                                    this.import_recent_items.push(item);
                                 }
+                                for notice in notices {
+                                    this.import_activity = notice;
+                                }
+                                this.import_recent_items
+                                    .drain(..this.import_recent_items.len().saturating_sub(6));
                                 cx.notify();
                             }
                         })
                         .ok();
                         last_update = Instant::now();
-                    }
-                    if !pending_thinking.is_empty() {
-                        this.update(&mut cx, |this, cx| {
-                            if this.importing {
-                                this.append_import_thinking(&pending_thinking);
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    }
-                    if !pending_answer.is_empty() {
-                        this.update(&mut cx, |this, cx| {
-                            if this.importing {
-                                this.append_import_answer(&pending_answer);
-                                cx.notify();
-                            }
-                        })
-                        .ok();
                     }
                 }
             },
@@ -545,7 +497,7 @@ impl NotesView {
                     let task_cancellation = cancellation.clone();
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
                         let report = move |event| {
-                            let _ = progress_tx.send(event);
+                            let _ = progress_tx.try_send(event);
                         };
                         let prepared = if source_path.is_empty() {
                             crate::ai::workflow::prepare_import_with_progress(
@@ -566,6 +518,9 @@ impl NotesView {
                             })
                             .await
                             .map_err(|error| anyhow::anyhow!("本地扫描任务失败: {error}"))??;
+                            for warning in &source.warnings {
+                                report(ImportEvent::Notice(warning.clone()));
+                            }
                             if !content.trim().is_empty() {
                                 source.text.push_str(
                                     "\n\n<!-- ruiz-source: manual-input -->\n# 手动补充内容\n\n",
@@ -593,14 +548,14 @@ impl NotesView {
                     match result {
                         Ok(summary) => {
                             let material_count = summary.note_ids.len();
-                            let question_count = summary.question_count;
+                            let activated_units = summary.activated_units;
                             let only_note = (material_count == 1).then(|| summary.note_ids[0]);
                             crate::diagnostics::info(
                                 "import.persistence.completed",
                                 "Smart import was saved to the database",
                                 serde_json::json!({
                                     "material_count": material_count,
-                                    "question_count": question_count,
+                                    "activated_units": activated_units,
                                     "note_ids": summary.note_ids,
                                 }),
                             );
@@ -616,16 +571,15 @@ impl NotesView {
                                 this.import_started_at = None;
                                 this.import_cancellation = None;
                                 this.import_cancelling = false;
-                                this.import_thinking.clear();
-                                this.import_thinking_chars = 0;
-                                this.import_answer_preview.clear();
-                                this.import_answer_chars = 0;
+                                this.import_activity.clear();
+                                this.import_recent_items.clear();
+                                this.import_stats = ImportStats::default();
                                 this.page = only_note
                                     .map(NotesPage::Detail)
                                     .unwrap_or(NotesPage::Library);
                                 this.notify(
                                     Notification::success(format!(
-                                        "AI 已整理出 {material_count} 篇材料，并准备 {question_count} 个复习知识点"
+                                        "AI 已整理出 {material_count} 篇材料，并激活 {activated_units} 个复习知识点"
                                     )),
                                     cx,
                                 );
@@ -658,10 +612,9 @@ impl NotesView {
                                 this.import_started_at = None;
                                 this.import_cancellation = None;
                                 this.import_cancelling = false;
-                                this.import_thinking.clear();
-                                this.import_thinking_chars = 0;
-                                this.import_answer_preview.clear();
-                                this.import_answer_chars = 0;
+                                this.import_activity.clear();
+                                this.import_recent_items.clear();
+                                this.import_stats = ImportStats::default();
                                 let notification = if was_cancelled {
                                     Notification::warning(
                                         "已取消智能导入，临时结果未写入资料库",
@@ -1429,7 +1382,7 @@ impl NotesView {
         .detach();
     }
 
-    /// 为旧笔记补建蓝图，并为 AI 推荐的知识单元准备复习降级数据。
+    /// 为旧笔记补建知识蓝图；复习题目在复习时按知识点动态生成。
     fn generate(&mut self, cx: &mut Context<Self>) {
         let Some(note_id) = self.page.note_id() else {
             self.notify(Notification::error("请先选中一篇笔记"), cx);
@@ -1445,14 +1398,7 @@ impl NotesView {
             );
             return;
         };
-        let has_analysis = self.analysis.is_some();
-        let remaining_units = self
-            .units
-            .iter()
-            .filter(|unit| !unit.generated && unit.recommended)
-            .cloned()
-            .collect::<Vec<_>>();
-        if has_analysis && remaining_units.is_empty() {
+        if self.analysis.is_some() {
             self.notify(Notification::success("复习内容已经准备完成"), cx);
             return;
         }
@@ -1468,40 +1414,19 @@ impl NotesView {
                 let mut cx = (*cx).clone();
                 async move {
                     let result = gpui_tokio::Tokio::spawn_result(&cx, async move {
-                        if has_analysis {
-                            let units = remaining_units
-                                .iter()
-                                .map(crate::ai::plan::PlanUnit::from)
-                                .collect::<Vec<_>>();
-                            let questions =
-                                crate::ai::generate::generate_questions(&ai, &units).await?;
-                            db::knowledge::save_generated_questions(&pool, note_id, &questions)
-                                .await?;
-                            anyhow::Ok(questions.len())
-                        } else {
-                            let plan =
-                                crate::ai::plan::analyze_material(&ai, &title, &content).await?;
-                            let selected = plan
-                                .units
-                                .iter()
-                                .filter(|unit| unit.recommended)
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            let questions =
-                                crate::ai::generate::generate_questions(&ai, &selected).await?;
-                            let prepared = crate::ai::workflow::PreparedMaterial {
-                                material: crate::ai::import::ImportedMaterial {
-                                    title,
-                                    content: content.clone(),
-                                    raw_content: content,
-                                    summary: String::new(),
-                                    document_type: "mixed".into(),
-                                },
-                                plan,
-                                questions,
-                            };
-                            db::knowledge::save_plan_for_note(&pool, note_id, &prepared).await
-                        }
+                        let plan =
+                            crate::ai::plan::analyze_material(&ai, &title, &content).await?;
+                        let prepared = crate::ai::workflow::PreparedMaterial {
+                            material: crate::ai::import::ImportedMaterial {
+                                title,
+                                content: content.clone(),
+                                raw_content: content,
+                                summary: String::new(),
+                                document_type: "mixed".into(),
+                            },
+                            plan,
+                        };
+                        db::knowledge::save_plan_for_note(&pool, note_id, &prepared).await
                     })
                     .await;
                     match result {
@@ -1510,7 +1435,7 @@ impl NotesView {
                                 this.generating = false;
                                 this.notify(
                                     Notification::success(format!(
-                                        "知识蓝图已更新，并准备 {n} 个复习知识点"
+                                        "知识蓝图已更新，并激活 {n} 个复习知识点"
                                     )),
                                     cx,
                                 );
@@ -1521,15 +1446,15 @@ impl NotesView {
                         }
                         Err(e) => {
                             crate::diagnostics::error(
-                                "questions.ui.failed",
-                                "Knowledge plan or question generation failed",
+                                "plan.ui.failed",
+                                "Knowledge plan generation failed",
                                 serde_json::json!({ "error": format!("{e:#}") }),
                             );
                             this.update(&mut cx, |this, cx| {
                                 this.generating = false;
                                 this.notify(
                                     Notification::error(format!(
-                                        "出题失败: {e}\n{}",
+                                        "知识蓝图生成失败: {e}\n{}",
                                         crate::diagnostics::log_hint()
                                     )),
                                     cx,
@@ -1560,20 +1485,23 @@ impl Render for NotesView {
             .clone()
             .unwrap_or_else(ImportProgress::preparing);
         let import_stage_position = import_progress.stage.position();
-        let import_stage_counter = if import_stage_position == 0 {
-            "正在启动工作流".to_string()
-        } else {
-            format!("阶段 {import_stage_position}/{}", ImportStage::TOTAL)
+        let import_stage_counter = match (import_progress.current, import_progress.total) {
+            (Some(current), Some(total)) if total > 0 => {
+                format!(
+                    "阶段 {import_stage_position}/{} · 项目 {current}/{total}",
+                    ImportStage::TOTAL
+                )
+            }
+            _ if import_stage_position == 0 => "正在启动工作流".to_string(),
+            _ => format!("阶段 {import_stage_position}/{}", ImportStage::TOTAL),
         };
         let import_elapsed = self
             .import_started_at
             .map(|started| format_elapsed(started.elapsed()))
             .unwrap_or_else(|| "0 秒".into());
-        let import_thinking = self.import_thinking.clone();
-        let import_thinking_chars = self.import_thinking_chars;
-        let import_answer_preview = self.import_answer_preview.clone();
-        let import_answer_chars = self.import_answer_chars;
-        let import_thinking_expanded = self.import_thinking_expanded;
+        let import_activity = self.import_activity.clone();
+        let import_recent_items = self.import_recent_items.clone();
+        let import_stats = self.import_stats.clone();
         let import_cancelling = self.import_cancelling;
         let import_can_cancel = self
             .import_cancellation
@@ -1833,7 +1761,9 @@ impl Render for NotesView {
                                         .child(format!("已运行 {import_elapsed}"))
                                         .child("·")
                                         .child(format!(
-                                            "已接收 {import_thinking_chars} 个思考字符"
+                                            "已整理 {} 篇材料 · {} 个知识单元",
+                                            import_stats.materials,
+                                            import_stats.topics,
                                         )),
                                 )
                                 .child(
@@ -1852,111 +1782,38 @@ impl Render for NotesView {
                                                         .gap_2()
                                                         .text_sm()
                                                         .font_medium()
-                                                        .child("AI 工作记录")
-                                                        .child(
-                                                            div()
-                                                                .px_1p5()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .bg(colors.warning.opacity(0.12))
-                                                                .text_xs()
-                                                                .text_color(colors.warning)
-                                                                .child("Beta"),
-                                                        ),
-                                                )
-                                                .child(
-                                                    Button::new("toggle-import-thinking")
-                                                        .icon(if import_thinking_expanded {
-                                                            IconName::ChevronUp
-                                                        } else {
-                                                            IconName::ChevronDown
-                                                        })
-                                                        .label(if import_thinking_expanded {
-                                                            "收起"
-                                                        } else {
-                                                            "展开"
-                                                        })
-                                                        .small()
-                                                        .outline()
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.import_thinking_expanded =
-                                                                !this.import_thinking_expanded;
-                                                            cx.notify();
-                                                        })),
+                                                        .child("最近完成"),
                                                 ),
                                         )
-                                        .when(import_thinking_expanded, |this| {
-                                            this.child(
-                                                v_flex()
-                                                    .w_full()
-                                                    .gap_1()
-                                                    .child(
+                                        .child(v_flex().w_full().gap_1().children(
+                                            if import_recent_items.is_empty() {
+                                                vec![
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors.muted_foreground)
+                                                        .child(import_activity.clone()),
+                                                ]
+                                            } else {
+                                                import_recent_items
+                                                    .iter()
+                                                    .map(|item| {
                                                         div()
                                                             .text_xs()
                                                             .text_color(colors.muted_foreground)
-                                                            .child(format!(
-                                                                "思考过程（{} 字符）",
-                                                                import_thinking_chars
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .max_h(px(180.))
-                                                            .overflow_y_scrollbar()
-                                                            .p_2()
-                                                            .rounded_md()
-                                                            .bg(colors.muted)
-                                                            .text_xs()
-                                                            .text_color(colors.muted_foreground)
-                                                            .whitespace_normal()
-                                                            .child(if import_thinking.is_empty() {
-                                                                "正在等待模型返回思考内容…".into()
-                                                            } else {
-                                                                SharedString::from(
-                                                                    import_thinking.clone(),
-                                                                )
-                                                            }),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(colors.muted_foreground)
-                                                            .child(format!(
-                                                                "答案增量（{} 字符，仅临时预览）",
-                                                                import_answer_chars
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .max_h(px(120.))
-                                                            .overflow_y_scrollbar()
-                                                            .p_2()
-                                                            .rounded_md()
-                                                            .bg(colors.muted)
-                                                            .text_xs()
-                                                            .text_color(colors.muted_foreground)
-                                                            .whitespace_normal()
-                                                            .child(
-                                                                if import_answer_preview.is_empty()
-                                                                {
-                                                                    "正在等待模型返回答案…".into()
-                                                                } else {
-                                                                    SharedString::from(
-                                                                        import_answer_preview
-                                                                            .clone(),
-                                                                    )
-                                                                },
-                                                            ),
-                                                    ),
-                                            )
-                                        })
+                                                            .child(SharedString::from(item.clone()))
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            },
+                                        ))
                                         .child(
                                             div()
                                                 .text_xs()
                                                 .text_color(colors.muted_foreground)
-                                                .child(crate::diagnostics::log_hint()),
+                                                .child(if import_stats.warnings == 0 {
+                                                    "已通过当前阶段校验"
+                                                } else {
+                                                    "检测到部分内容需要留意，请在任务完成后查看警告"
+                                                }),
                                         ),
                                 )
                                 .child(Skeleton::new().secondary().w_4_5()),
@@ -2109,27 +1966,15 @@ impl Render for NotesView {
                         note.map(|note| note.title.clone())
                             .unwrap_or_else(|| "笔记详情".into()),
                     ));
-                let remaining_count = self
-                    .units
-                    .iter()
-                    .filter(|unit| !unit.generated && unit.recommended)
-                    .count();
-                let generate_label = if self.analysis.is_some() {
-                    if self.generating {
-                        "正在准备…".to_string()
-                    } else if remaining_count == 0 {
-                        "复习内容已准备".to_string()
-                    } else {
-                        format!("准备 {remaining_count} 个推荐知识点")
-                    }
-                } else if self.generating {
+                let generate_label = if self.generating {
                     "分析中…".to_string()
+                } else if self.analysis.is_some() {
+                    "复习内容已准备".to_string()
                 } else {
                     "建立知识蓝图".to_string()
                 };
                 let generate_bar = should_show_generate_bar(
                     self.analysis.is_some(),
-                    remaining_count,
                     self.generating,
                 )
                 .then(|| {
@@ -2542,8 +2387,8 @@ fn matches_group_filter(group_id: i64, selected_group_ids: &[i64]) -> bool {
     selected_group_ids.is_empty() || selected_group_ids.contains(&group_id)
 }
 
-fn should_show_generate_bar(has_analysis: bool, remaining_count: usize, generating: bool) -> bool {
-    !has_analysis || remaining_count > 0 || generating
+fn should_show_generate_bar(has_analysis: bool, generating: bool) -> bool {
+    !has_analysis || generating
 }
 
 #[cfg(test)]
@@ -2567,10 +2412,9 @@ mod tests {
 
     #[test]
     fn completed_blueprint_hides_generate_bar() {
-        assert!(!should_show_generate_bar(true, 0, false));
-        assert!(should_show_generate_bar(false, 0, false));
-        assert!(should_show_generate_bar(true, 1, false));
-        assert!(should_show_generate_bar(true, 0, true));
+        assert!(!should_show_generate_bar(true, false));
+        assert!(should_show_generate_bar(false, false));
+        assert!(should_show_generate_bar(true, true));
     }
 
     #[test]

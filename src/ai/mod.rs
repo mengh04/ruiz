@@ -2,7 +2,6 @@
 
 pub mod client;
 pub mod dynamic_question;
-pub mod generate;
 pub mod image;
 pub mod import;
 pub mod judge;

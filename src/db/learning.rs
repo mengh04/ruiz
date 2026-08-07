@@ -497,7 +497,6 @@ pub async fn insert_prompt(pool: &SqlitePool, prompt: &LearningPrompt) -> Result
 }
 
 pub async fn fallback_prompt(
-    pool: &SqlitePool,
     step: &LearningStep,
     units: &[KnowledgeUnit],
     target_unit_ids: &[String],
@@ -517,22 +516,12 @@ pub async fn fallback_prompt(
         .iter()
         .flat_map(|unit| unit.required_points.clone())
         .collect::<Vec<_>>();
+    // 复习题目一律在复习时按知识单元动态生成；兜底题直接用学习目标现场拼接。
     let (question, standard_answer) = if selected.len() == 1 {
-        let row = sqlx::query(
-            "SELECT c.question, c.standard_answer
-             FROM card_knowledge_units cku JOIN cards c ON c.id = cku.card_id
-             WHERE cku.knowledge_unit_id = ?1 ORDER BY c.id LIMIT 1",
+        (
+            format!("请完成以下学习任务：{}", primary.objective),
+            primary.required_points.join("；"),
         )
-        .bind(primary.id)
-        .fetch_optional(pool)
-        .await?;
-        row.map(|row| (row.get("question"), row.get("standard_answer")))
-            .unwrap_or_else(|| {
-                (
-                    format!("请完成以下学习任务：{}", primary.objective),
-                    primary.required_points.join("；"),
-                )
-            })
     } else {
         let objectives = selected
             .iter()
@@ -631,7 +620,7 @@ fn result_rank(result: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{db, domain::card::Card};
+    use crate::db;
 
     #[tokio::test]
     async fn learning_session_resumes_and_gates_review() {
@@ -639,15 +628,19 @@ mod tests {
         let note_id = db::notes::create(&pool, "测试", "# 标题\n\n证据内容")
             .await
             .unwrap();
-        db::cards::insert(
-            &pool,
-            &Card::new(
-                note_id,
-                "问题".into(),
-                "答案".into(),
-                Some("证据内容".into()),
-            ),
+        // 直接插入一个已激活（generated=1、已引入复习）的知识单元，替代旧版卡片。
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO knowledge_units
+                (note_id, local_id, topic, objective, unit_type, importance, stage,
+                 cognitive_action, required_points_json, claim_ids_json, evidence_json,
+                 reason, quick, recommended, generated, due, introduced_at, position)
+             VALUES (?1, 'K1', '测试', '问题', 'concept', 'core', 'foundation', 'recall',
+                     json_array('答案'), '[]', json_array('证据内容'), '测试单元', 1, 1, 1, ?2, ?2, 0)",
         )
+        .bind(note_id)
+        .bind(now)
+        .execute(&pool)
         .await
         .unwrap();
         let note = db::notes::get(&pool, note_id).await.unwrap().unwrap();
@@ -696,7 +689,7 @@ mod tests {
             .find(|step| step.kind == LearningStepKind::Checkpoint)
             .unwrap();
         let targets = crate::domain::learning::checkpoint_question_targets(checkpoint, &units);
-        let first_prompt = fallback_prompt(&pool, checkpoint, &units, &targets[0], 0)
+        let first_prompt = fallback_prompt(checkpoint, &units, &targets[0], 0)
             .await
             .unwrap();
         let first_prompt = insert_prompt(&pool, &first_prompt).await.unwrap();

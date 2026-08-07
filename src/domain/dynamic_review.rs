@@ -145,10 +145,6 @@ pub struct ReviewItem {
     pub cognitive_action: String,
     pub required_points: Vec<String>,
     pub evidence: Vec<String>,
-    pub seed_card_id: Option<i64>,
-    pub fallback_question: Option<String>,
-    pub fallback_answer: Option<String>,
-    pub fallback_source: Option<String>,
     pub memory: Option<MemoryState>,
     pub reps: u32,
     pub lapses: u32,
@@ -200,26 +196,18 @@ impl ReviewItem {
         }
     }
 
+    /// 动态生成失败时的兜底题：直接用学习目标和必答点现场拼接。
     pub fn fallback_prompt(&self) -> ReviewPrompt {
         ReviewPrompt {
             id: None,
             unit_id: self.unit_id,
             format: QuestionFormat::ShortAnswer,
             mastery: self.mastery_band(),
-            question: self
-                .fallback_question
-                .clone()
-                .unwrap_or_else(|| format!("请完成这个学习目标：{}", self.objective)),
+            question: format!("请完成这个学习目标：{}", self.objective),
             options: Vec::new(),
-            standard_answer: self
-                .fallback_answer
-                .clone()
-                .unwrap_or_else(|| self.required_points.join("；")),
+            standard_answer: self.required_points.join("；"),
             required_points: self.required_points.clone(),
-            source_excerpt: self
-                .fallback_source
-                .clone()
-                .or_else(|| Some(self.evidence.join("\n"))),
+            source_excerpt: Some(self.evidence.join("\n")),
             generation_mode: "fallback".into(),
         }
     }
@@ -255,10 +243,6 @@ mod tests {
             cognitive_action: "recall".into(),
             required_points: vec!["要点".into()],
             evidence: vec!["证据".into()],
-            seed_card_id: None,
-            fallback_question: None,
-            fallback_answer: None,
-            fallback_source: None,
             memory,
             reps,
             lapses,

@@ -14,7 +14,6 @@ pub enum ImportStage {
     Organizing,
     Extracting,
     Reconciling,
-    Generating,
     Saving,
 }
 
@@ -29,7 +28,6 @@ impl ImportStage {
             Self::Organizing => "归并并命名材料",
             Self::Extracting => "提取知识单元",
             Self::Reconciling => "整理知识蓝图",
-            Self::Generating => "准备复习备用题",
             Self::Saving => "保存到资料库",
         }
     }
@@ -41,8 +39,7 @@ impl ImportStage {
             Self::Cleaning => 1,
             Self::Organizing => 2,
             Self::Extracting => 3,
-            Self::Reconciling => 3,
-            Self::Generating => 4,
+            Self::Reconciling => 4,
             Self::Saving => 5,
         }
     }
@@ -52,6 +49,8 @@ impl ImportStage {
 pub struct ImportProgress {
     pub stage: ImportStage,
     pub detail: String,
+    pub current: Option<usize>,
+    pub total: Option<usize>,
 }
 
 impl ImportProgress {
@@ -59,6 +58,8 @@ impl ImportProgress {
         Self {
             stage: ImportStage::Preparing,
             detail: "正在检查输入并准备完整上下文请求".into(),
+            current: None,
+            total: None,
         }
     }
 
@@ -66,15 +67,37 @@ impl ImportProgress {
         Self {
             stage,
             detail: detail.into(),
+            current: None,
+            total: None,
         }
     }
+
+    pub fn with_counts(mut self, current: usize, total: usize) -> Self {
+        self.current = Some(current);
+        self.total = Some(total);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportStats {
+    pub materials: usize,
+    pub topics: usize,
+    pub warnings: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportEvent {
     Stage(ImportProgress),
-    Thinking(String),
-    Answer(String),
+    ItemCompleted {
+        stage: ImportStage,
+        index: usize,
+        total: usize,
+        label: String,
+        summary: String,
+    },
+    Notice(String),
+    Stats(ImportStats),
 }
 
 pub type ImportEventReporter = dyn Fn(ImportEvent) + Send + Sync;

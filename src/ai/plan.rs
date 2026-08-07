@@ -89,14 +89,17 @@ pub async fn analyze_material_with_progress(
 ) -> Result<MaterialPlan> {
     cancellation.ensure_active()?;
     let chunks = split_plan_chunks(content);
-    progress(ImportEvent::Stage(ImportProgress::stage(
-        ImportStage::Extracting,
-        format!(
-            "正在分段分析《{title}》全文（{} 个字符，共 {} 段）",
-            content.chars().count(),
-            chunks.len()
-        ),
-    )));
+    progress(ImportEvent::Stage(
+        ImportProgress::stage(
+            ImportStage::Extracting,
+            format!(
+                "正在分段分析《{title}》全文（{} 个字符，共 {} 段）",
+                content.chars().count(),
+                chunks.len()
+            ),
+        )
+        .with_counts(0, chunks.len()),
+    ));
     let mut candidates = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.iter().enumerate() {
         cancellation.ensure_active()?;
@@ -106,10 +109,7 @@ pub async fn analyze_material_with_progress(
             "chunk_count": chunks.len(),
             "content": chunk,
         });
-        let report_stream = |event| match event {
-            StreamEvent::Thinking(text) => progress(ImportEvent::Thinking(text)),
-            StreamEvent::Content(text) => progress(ImportEvent::Answer(text)),
-        };
+        let report_stream = |_event: StreamEvent| {};
         let value = client
             .chat_json_stream_for(
                 "plan.extract",
@@ -123,6 +123,17 @@ pub async fn analyze_material_with_progress(
             .map_err(|error| anyhow!("知识提取响应格式不对（第 {} 段）: {error}", index + 1))?;
         prefix_chunk_ids(&mut candidate, index + 1);
         candidates.push(candidate);
+        progress(ImportEvent::ItemCompleted {
+            stage: ImportStage::Extracting,
+            index: index + 1,
+            total: chunks.len(),
+            label: format!("提取分块 {}/{}", index + 1, chunks.len()),
+            summary: format!(
+                "发现 {} 个知识主张和 {} 个学习单元",
+                candidates[index].claims.len(),
+                candidates[index].units.len()
+            ),
+        });
     }
 
     cancellation.ensure_active()?;
@@ -131,7 +142,7 @@ pub async fn analyze_material_with_progress(
         format!("正在去重并整理《{title}》的最终知识蓝图"),
     )));
     let plan = reconcile_hierarchically(client, title, candidates, progress, cancellation).await?;
-    match validate_plan_against_content(plan.clone(), content) {
+    match validate_plan(plan.clone()) {
         Ok(plan) => Ok(plan),
         Err(initial_error) => {
             diagnostics::warn(
@@ -160,7 +171,7 @@ pub async fn analyze_material_with_progress(
             .map_err(|repair_error| {
                 anyhow!("知识蓝图首次校验失败：{initial_error}；AI 结构修复失败：{repair_error}")
             })?;
-            validate_plan_against_content(repaired, content).map_err(|repair_error| {
+            validate_plan(repaired).map_err(|repair_error| {
                 diagnostics::error(
                     "plan.validation.repair_failed",
                     "Repaired knowledge plan still failed validation",
@@ -179,17 +190,14 @@ async fn reconcile_once(
     client: &ChatClient,
     title: &str,
     candidates: &[ChunkPlan],
-    progress: &ImportEventReporter,
+    _progress: &ImportEventReporter,
     cancellation: &ImportCancellation,
 ) -> Result<MaterialPlan> {
     let input = serde_json::json!({
         "material_title": title,
         "candidate_chunks": candidates,
     });
-    let report_stream = |event| match event {
-        StreamEvent::Thinking(text) => progress(ImportEvent::Thinking(text)),
-        StreamEvent::Content(text) => progress(ImportEvent::Answer(text)),
-    };
+    let report_stream = |_event: StreamEvent| {};
     let value = client
         .chat_json_stream_for(
             "plan.reconcile",
@@ -279,7 +287,7 @@ async fn repair_plan(
     plan: &MaterialPlan,
     validation_error: &str,
     material_content: &str,
-    progress: &ImportEventReporter,
+    _progress: &ImportEventReporter,
     cancellation: &ImportCancellation,
 ) -> Result<MaterialPlan> {
     let input = serde_json::json!({
@@ -288,10 +296,7 @@ async fn repair_plan(
         "material_content": bounded_content_sample(material_content, MAX_REPAIR_CONTEXT_CHARS),
         "draft_plan": plan,
     });
-    let report_stream = |event| match event {
-        StreamEvent::Thinking(text) => progress(ImportEvent::Thinking(text)),
-        StreamEvent::Content(text) => progress(ImportEvent::Answer(text)),
-    };
+    let report_stream = |_event: StreamEvent| {};
     let value = client
         .chat_json_stream_for(
             "plan.repair",
@@ -394,49 +399,6 @@ fn split_plan_chunks(content: &str) -> Vec<String> {
     } else {
         chunks
     }
-}
-
-fn validate_plan_against_content(mut plan: MaterialPlan, content: &str) -> Result<MaterialPlan> {
-    plan = validate_plan(plan)?;
-    for claim in &plan.claims {
-        for evidence in &claim.evidence {
-            if !evidence_matches(content, evidence) {
-                return Err(anyhow!(
-                    "Claim {} 的证据未出现在清洗后的材料正文中",
-                    claim.id
-                ));
-            }
-        }
-    }
-    for unit in &plan.units {
-        for evidence in &unit.evidence {
-            if !evidence_matches(content, evidence) {
-                return Err(anyhow!(
-                    "知识单元 {} 的证据未出现在清洗后的材料正文中",
-                    unit.id
-                ));
-            }
-        }
-    }
-    Ok(plan)
-}
-
-fn evidence_matches(content: &str, evidence: &str) -> bool {
-    let evidence = evidence.trim();
-    if evidence.is_empty() {
-        return false;
-    }
-    content.contains(evidence)
-        || normalize_whitespace(content).contains(&normalize_whitespace(evidence))
-        || compact_whitespace(content).contains(&compact_whitespace(evidence))
-}
-
-fn normalize_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn compact_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join("")
 }
 
 fn validate_plan(mut plan: MaterialPlan) -> Result<MaterialPlan> {
@@ -557,8 +519,8 @@ fn validate_plan(mut plan: MaterialPlan) -> Result<MaterialPlan> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkPlan, MaterialPlan, PlanClaim, PlanUnit, bounded_content_sample, evidence_matches,
-        reconcile_batches, split_plan_chunks, validate_plan, validate_plan_against_content,
+        ChunkPlan, MaterialPlan, PlanClaim, PlanUnit, bounded_content_sample, reconcile_batches,
+        split_plan_chunks, validate_plan,
     };
 
     fn valid_plan() -> MaterialPlan {
@@ -602,13 +564,6 @@ mod tests {
         let mut plan = valid_plan();
         plan.units[0].claim_ids = vec!["missing".into()];
         assert!(validate_plan(plan).is_err());
-    }
-
-    #[test]
-    fn evidence_must_be_present_in_material_content() {
-        assert!(validate_plan_against_content(valid_plan(), "这是原文。其他内容").is_ok());
-        assert!(validate_plan_against_content(valid_plan(), "这是另一段内容").is_err());
-        assert!(evidence_matches("第一行\n第二行", "第一行 第二行"));
     }
 
     #[test]

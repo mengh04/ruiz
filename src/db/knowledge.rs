@@ -1,18 +1,16 @@
-use std::collections::HashMap;
-
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
-    ai::{generate::Question, plan::PlanUnit, workflow::PreparedMaterial},
+    ai::{plan::PlanUnit, workflow::PreparedMaterial},
     domain::knowledge::{KnowledgeUnit, MaterialAnalysis},
 };
 
 #[derive(Debug)]
 pub struct ImportSummary {
     pub note_ids: Vec<i64>,
-    pub question_count: usize,
+    pub activated_units: usize,
 }
 
 /// 原子地保存一次智能导入，避免 AI 工作流中途失败后留下半篇材料。
@@ -59,7 +57,7 @@ pub async fn save_import(
     }
 
     let mut note_ids = Vec::with_capacity(prepared.len());
-    let mut question_count = 0;
+    let mut activated_units = 0;
 
     for item in prepared {
         let note_id: i64 = sqlx::query(
@@ -75,16 +73,16 @@ pub async fn save_import(
         .get("id");
         note_ids.push(note_id);
 
-        question_count += insert_prepared_data(&mut transaction, note_id, item, &now).await?;
+        activated_units += insert_prepared_data(&mut transaction, note_id, item, &now).await?;
     }
     transaction.commit().await?;
     Ok(ImportSummary {
         note_ids,
-        question_count,
+        activated_units,
     })
 }
 
-/// 为旧版笔记补建知识蓝图并生成复习基础题。
+/// 为旧版笔记补建知识蓝图（复习题目在复习时动态生成）。
 pub async fn save_plan_for_note(
     pool: &SqlitePool,
     note_id: i64,
@@ -152,16 +150,16 @@ async fn insert_prepared_data(
         .await?;
     }
 
-    let mut unit_ids = HashMap::new();
     for (position, unit) in item.plan.units.iter().enumerate() {
-        let unit_id: i64 = sqlx::query(
+        sqlx::query(
             "INSERT INTO knowledge_units
                 (note_id, local_id, topic, objective, unit_type, importance, stage,
                  cognitive_action, required_points_json, claim_ids_json, evidence_json,
                  reason, quick, recommended, generated, stability, difficulty, due,
-                 reps, lapses, last_review, prerequisite_ids_json, position)
+                 reps, lapses, last_review, introduced_at, prerequisite_ids_json, position)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, 0, NULL, NULL, ?15, 0, 0, NULL, ?16, ?17)
+                     ?13, ?14, ?15, NULL, NULL, ?16, 0, 0, NULL,
+                     CASE WHEN ?15 = 1 THEN ?17 ELSE NULL END, ?18, ?19)
              RETURNING id",
         )
         .bind(note_id)
@@ -178,22 +176,18 @@ async fn insert_prepared_data(
         .bind(&unit.reason)
         .bind(i64::from(unit.quick))
         .bind(i64::from(unit.recommended))
+        // 推荐单元导入即激活并引入复习队列：题目在复习时按知识点动态生成。
+        .bind(i64::from(unit.recommended))
+        .bind(now)
         .bind(now)
         .bind(serde_json::to_string(&unit.prerequisite_unit_ids)?)
         .bind(position as i64)
         .fetch_one(&mut **transaction)
         .await?
-        .get("id");
-        unit_ids.insert(unit.id.as_str(), unit_id);
+        .get::<i64, _>("id");
     }
 
-    for question in &item.questions {
-        let unit_id = *unit_ids
-            .get(question.unit_id.as_str())
-            .ok_or_else(|| anyhow!("题目引用了不存在的知识单元: {}", question.unit_id))?;
-        insert_question(transaction, note_id, unit_id, question, now).await?;
-    }
-    Ok(item.questions.len())
+    Ok(item.plan.units.iter().filter(|unit| unit.recommended).count())
 }
 
 pub async fn analysis_by_note(pool: &SqlitePool, note_id: i64) -> Result<Option<MaterialAnalysis>> {
@@ -221,65 +215,6 @@ pub async fn units_by_note(pool: &SqlitePool, note_id: i64) -> Result<Vec<Knowle
         .fetch_all(pool)
         .await?;
     rows.iter().map(unit_from_row).collect()
-}
-
-pub async fn save_generated_questions(
-    pool: &SqlitePool,
-    note_id: i64,
-    questions: &[Question],
-) -> Result<()> {
-    let mut transaction = pool.begin().await?;
-    let now = Utc::now().to_rfc3339();
-    for question in questions {
-        let unit_id: i64 = sqlx::query(
-            "SELECT id FROM knowledge_units
-             WHERE note_id = ?1 AND local_id = ?2 AND generated = 0",
-        )
-        .bind(note_id)
-        .bind(&question.unit_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or_else(|| anyhow!("知识单元不存在或已经生成题目: {}", question.unit_id))?
-        .get("id");
-        insert_question(&mut transaction, note_id, unit_id, question, &now).await?;
-    }
-    transaction.commit().await?;
-    Ok(())
-}
-
-async fn insert_question(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    note_id: i64,
-    unit_id: i64,
-    question: &Question,
-    now: &str,
-) -> Result<()> {
-    let card_id: i64 = sqlx::query(
-        "INSERT INTO cards
-            (note_id, question, standard_answer, source_excerpt,
-             stability, difficulty, due, reps, lapses, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, 0, 0, ?5, ?5)
-         RETURNING id",
-    )
-    .bind(note_id)
-    .bind(&question.question)
-    .bind(&question.standard_answer)
-    .bind(&question.source_excerpt)
-    .bind(now)
-    .fetch_one(&mut **transaction)
-    .await?
-    .get("id");
-    sqlx::query("INSERT INTO card_knowledge_units (card_id, knowledge_unit_id) VALUES (?1, ?2)")
-        .bind(card_id)
-        .bind(unit_id)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("UPDATE knowledge_units SET generated = 1, due = COALESCE(due, ?2) WHERE id = ?1")
-        .bind(unit_id)
-        .bind(now)
-        .execute(&mut **transaction)
-        .await?;
-    Ok(())
 }
 
 fn unit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<KnowledgeUnit> {

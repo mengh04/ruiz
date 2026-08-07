@@ -76,18 +76,18 @@ pub async fn import_materials(
     cancellation.ensure_active()?;
     let source = normalize_source(raw)?;
     let chunks = split_clean_chunks(&source);
-    progress(ImportEvent::Stage(ImportProgress::stage(
-        ImportStage::Cleaning,
-        format!(
-            "正在分段清洗材料（{} 个字符，共 {} 段），移除导航、广告和重复目录",
-            source.chars().count(),
-            chunks.len()
-        ),
-    )));
-    let report_stream = |event| match event {
-        StreamEvent::Thinking(text) => progress(ImportEvent::Thinking(text)),
-        StreamEvent::Content(text) => progress(ImportEvent::Answer(text)),
-    };
+    progress(ImportEvent::Stage(
+        ImportProgress::stage(
+            ImportStage::Cleaning,
+            format!(
+                "正在分段清洗材料（{} 个字符，共 {} 段），移除导航、广告和重复目录",
+                source.chars().count(),
+                chunks.len()
+            ),
+        )
+        .with_counts(0, chunks.len()),
+    ));
+    let report_stream = |_event: StreamEvent| {};
     let mut stored = Vec::new();
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         cancellation.ensure_active()?;
@@ -122,6 +122,13 @@ pub async fn import_materials(
                 source_order: chunk_index * MAX_CLEAN_CHUNK_CHARS + index,
             });
         }
+        progress(ImportEvent::ItemCompleted {
+            stage: ImportStage::Cleaning,
+            index: chunk_index + 1,
+            total: chunks.len(),
+            label: format!("清洗分块 {}/{}", chunk_index + 1, chunks.len()),
+            summary: format!("保留 {} 个有效片段", stored.len()),
+        });
     }
 
     cancellation.ensure_active()?;
@@ -201,6 +208,10 @@ pub async fn import_materials(
     if materials.is_empty() {
         return Err(anyhow!("AI 整理后没有留下有效材料"));
     }
+    progress(ImportEvent::Stats(super::progress::ImportStats {
+        materials: materials.len(),
+        ..Default::default()
+    }));
     Ok(materials)
 }
 

@@ -2,7 +2,6 @@
 //!
 //! 长提示词独立为 Markdown，便于评审、版本管理和后续建立快照测试。
 
-pub const GENERATE_SYSTEM: &str = include_str!("generate_system.md");
 pub const DYNAMIC_QUESTION_SYSTEM: &str = include_str!("dynamic_question_system.md");
 pub const IMPORT_CLEAN_SYSTEM: &str = include_str!("import_clean_system.md");
 pub const IMPORT_ORGANIZE_SYSTEM: &str = include_str!("import_organize_system.md");
@@ -25,7 +24,6 @@ mod tests {
         assert!(PLAN_CHUNK_SYSTEM.contains("required_points"));
         assert!(PLAN_RECONCILE_SYSTEM.contains("recommended"));
         assert!(PLAN_REPAIR_SYSTEM.contains("relation + compare"));
-        assert!(GENERATE_SYSTEM.contains("恰好返回一道题"));
         assert!(DYNAMIC_QUESTION_SYSTEM.contains("recent_questions"));
         assert!(JUDGE_SYSTEM.contains("point_results"));
     }

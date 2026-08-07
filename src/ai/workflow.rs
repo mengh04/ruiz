@@ -9,15 +9,13 @@ use crate::diagnostics;
 
 use super::{
     client::ChatClient,
-    generate::{Question, generate_questions_with_progress},
     image::{VisionClient, append_image_context, describe_images},
     import::{ImportedMaterial, import_materials},
-    plan::{MaterialPlan, PlanUnit, analyze_material_with_progress},
+    plan::{MaterialPlan, analyze_material_with_progress},
     progress::{ImportCancellation, ImportEvent, ImportEventReporter, ImportProgress, ImportStage},
     source::SourceBundle,
 };
 
-const MAX_QUESTIONS_PER_IMPORT: usize = 160;
 const MAX_STAGE_ATTEMPTS: usize = 2;
 static NEXT_WORKFLOW_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -25,7 +23,6 @@ static NEXT_WORKFLOW_ID: AtomicU64 = AtomicU64::new(1);
 pub struct PreparedMaterial {
     pub material: ImportedMaterial,
     pub plan: MaterialPlan,
-    pub questions: Vec<Question>,
 }
 
 /// Prepares a scanned local source. Images are read and uploaded only when an
@@ -113,8 +110,8 @@ pub async fn prepare_import_with_progress(
             })).collect::<Vec<_>>(),
         }),
     );
-    let mut planned =
-        Vec::<(ImportedMaterial, MaterialPlan, Vec<PlanUnit>)>::with_capacity(materials.len());
+    let material_total = materials.len();
+    let mut planned = Vec::<(ImportedMaterial, MaterialPlan)>::with_capacity(materials.len());
     for (index, material) in materials.into_iter().enumerate() {
         diagnostics::info(
             "import.workflow.plan_started",
@@ -160,12 +157,6 @@ pub async fn prepare_import_with_progress(
         if plan.document_type.trim().is_empty() {
             plan.document_type = material.document_type.clone();
         }
-        let selected = plan
-            .units
-            .iter()
-            .filter(|unit| unit.recommended)
-            .cloned()
-            .collect::<Vec<_>>();
         diagnostics::info(
             "import.workflow.plan_ready",
             "Knowledge plan is ready",
@@ -174,135 +165,51 @@ pub async fn prepare_import_with_progress(
                 "workflow_id": workflow_id,
                 "claims": plan.claims.len(),
                 "units": plan.units.len(),
-                "recommended_units": selected.len(),
+                "recommended_units": plan.units.iter().filter(|unit| unit.recommended).count(),
                 "warning_count": plan.warnings.len(),
             }),
         );
-        planned.push((material, plan, selected));
-    }
-
-    let selected_before_cap = planned
-        .iter()
-        .map(|(_, _, units)| units.len())
-        .sum::<usize>();
-    let total_questions = cap_question_units(&mut planned, MAX_QUESTIONS_PER_IMPORT);
-    if selected_before_cap > total_questions {
-        diagnostics::warn(
-            "import.workflow.questions_capped",
-            "Seed question generation was capped for a large import",
-            serde_json::json!({
-                "workflow_id": workflow_id,
-                "selected_units": selected_before_cap,
-                "generated_seed_questions": total_questions,
-                "cap": MAX_QUESTIONS_PER_IMPORT,
-            }),
-        );
+        progress(ImportEvent::ItemCompleted {
+            stage: ImportStage::Extracting,
+            index: index + 1,
+            total: material_total,
+            label: material.title.clone(),
+            summary: format!(
+                "知识蓝图已完成：{} 个主张，{} 个学习单元，{} 个警告",
+                plan.claims.len(),
+                plan.units.len(),
+                plan.warnings.len()
+            ),
+        });
+        if !plan.warnings.is_empty() {
+            progress(ImportEvent::Notice(format!(
+                "《{}》有 {} 条内容警告，已保留在知识蓝图中",
+                material.title,
+                plan.warnings.len()
+            )));
+        }
+        planned.push((material, plan));
     }
 
     cancellation.ensure_active()?;
-    let mut prepared = Vec::with_capacity(planned.len());
-    for (index, (material, plan, selected)) in planned.into_iter().enumerate() {
-        cancellation.ensure_active()?;
-        let questions = run_stage_with_recovery(
-            "questions.generate",
-            ImportStage::Generating,
-            progress,
-            cancellation,
-            workflow_id,
-            || {
-                generate_questions_with_progress(
-                    client,
-                    &selected,
-                    &material.title,
-                    progress,
-                    cancellation,
-                )
-            },
-        )
-        .await
-        .map_err(|error| {
-            diagnostics::error(
-                "import.workflow.questions_failed",
-                "Question generation failed",
-                serde_json::json!({
-                    "material_index": index + 1,
-                    "workflow_id": workflow_id,
-                    "unit_count": selected.len(),
-                    "error": format!("{error:#}"),
-                }),
-            );
-            error
-        })?;
-        prepared.push(PreparedMaterial {
-            material,
-            plan,
-            questions,
-        });
-    }
+    let prepared = planned
+        .into_iter()
+        .map(|(material, plan)| PreparedMaterial { material, plan })
+        .collect::<Vec<_>>();
+    progress(ImportEvent::Stats(super::progress::ImportStats {
+        materials: prepared.len(),
+        topics: prepared.iter().map(|item| item.plan.units.len()).sum(),
+        warnings: prepared.iter().map(|item| item.plan.warnings.len()).sum(),
+    }));
     diagnostics::info(
         "import.workflow.completed",
         "Smart import workflow completed",
         serde_json::json!({
             "material_count": prepared.len(),
             "workflow_id": workflow_id,
-            "question_count": total_questions,
         }),
     );
     Ok(prepared)
-}
-
-fn cap_question_units(
-    planned: &mut [(ImportedMaterial, MaterialPlan, Vec<PlanUnit>)],
-    max: usize,
-) -> usize {
-    let total = planned
-        .iter()
-        .map(|(_, _, units)| units.len())
-        .sum::<usize>();
-    if total <= max {
-        return total;
-    }
-    for (_, _, units) in planned.iter_mut() {
-        units.sort_by_key(|unit| {
-            (
-                usize::from(!unit.quick),
-                match unit.importance.as_str() {
-                    "core" => 0,
-                    "supporting" => 1,
-                    _ => 2,
-                },
-                match unit.stage.as_str() {
-                    "foundation" => 0,
-                    "relationship" => 1,
-                    _ => 2,
-                },
-            )
-        });
-    }
-    let mut retained = vec![Vec::new(); planned.len()];
-    let mut positions = vec![0usize; planned.len()];
-    let mut count = 0usize;
-    while count < max {
-        let mut advanced = false;
-        for (index, (_, _, units)) in planned.iter().enumerate() {
-            if count == max {
-                break;
-            }
-            if let Some(unit) = units.get(positions[index]) {
-                retained[index].push(unit.clone());
-                positions[index] += 1;
-                count += 1;
-                advanced = true;
-            }
-        }
-        if !advanced {
-            break;
-        }
-    }
-    for ((_, _, units), retained) in planned.iter_mut().zip(retained) {
-        *units = retained;
-    }
-    count
 }
 
 /// Runs one workflow stage with a bounded recovery attempt.  The retry is

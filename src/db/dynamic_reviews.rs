@@ -16,17 +16,9 @@ pub async fn due_in_scope(
 ) -> Result<Vec<ReviewItem>> {
     let group_ids_json = serde_json::to_string(group_ids)?;
     let rows = sqlx::query(
-        "SELECT ku.*, n.title AS note_title,
-                c.id AS seed_card_id, c.question AS fallback_question,
-                c.standard_answer AS fallback_answer,
-                c.source_excerpt AS fallback_source
+        "SELECT ku.*, n.title AS note_title
          FROM knowledge_units ku
          JOIN notes n ON n.id = ku.note_id
-         LEFT JOIN cards c ON c.id = (
-             SELECT cku.card_id FROM card_knowledge_units cku
-             WHERE cku.knowledge_unit_id = ku.id
-             ORDER BY cku.card_id LIMIT 1
-         )
          WHERE ku.generated = 1 AND ku.introduced_at IS NOT NULL AND ku.due <= ?1
            AND (json_array_length(?2) = 0 OR n.group_id IN (
                SELECT value FROM json_each(?2)
@@ -117,13 +109,12 @@ pub async fn complete_review(
     }
     sqlx::query(
         "INSERT INTO review_attempts
-            (knowledge_unit_id, prompt_id, seed_card_id, user_answer,
+            (knowledge_unit_id, prompt_id, user_answer,
              ai_feedback, rating, reviewed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(item.unit_id)
     .bind(prompt_id)
-    .bind(item.seed_card_id)
     .bind(user_answer)
     .bind(ai_feedback)
     .bind(rating as i64)
@@ -131,34 +122,6 @@ pub async fn complete_review(
     .execute(&mut *transaction)
     .await?;
 
-    if let Some(card_id) = item.seed_card_id {
-        sqlx::query(
-            "UPDATE cards
-             SET stability = ?1, difficulty = ?2, due = ?3, reps = ?4,
-                 lapses = ?5, last_review = ?6, updated_at = ?6
-             WHERE id = ?7",
-        )
-        .bind(memory.stability)
-        .bind(memory.difficulty)
-        .bind(due.to_rfc3339())
-        .bind(reps as i64)
-        .bind(lapses as i64)
-        .bind(&now)
-        .bind(card_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "INSERT INTO reviews (card_id, user_answer, ai_feedback, rating, reviewed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(card_id)
-        .bind(user_answer)
-        .bind(ai_feedback)
-        .bind(rating as i64)
-        .bind(&now)
-        .execute(&mut *transaction)
-        .await?;
-    }
     transaction.commit().await?;
     Ok(())
 }
@@ -182,10 +145,6 @@ fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewItem> {
         cognitive_action: row.get("cognitive_action"),
         required_points: parse_json(row.get("required_points_json"))?,
         evidence: parse_json(row.get("evidence_json"))?,
-        seed_card_id: row.get("seed_card_id"),
-        fallback_question: row.get("fallback_question"),
-        fallback_answer: row.get("fallback_answer"),
-        fallback_source: row.get("fallback_source"),
         memory,
         reps: row.get::<i64, _>("reps") as u32,
         lapses: row.get::<i64, _>("lapses") as u32,
@@ -204,7 +163,36 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
-    use crate::{db, domain::card::Card};
+    use crate::db;
+
+    /// 直接插入一个已激活（generated=1、到期）的知识单元，替代旧版依赖卡片的方式。
+    async fn insert_active_unit(
+        pool: &SqlitePool,
+        note_id: i64,
+        local_id: &str,
+        objective: &str,
+    ) -> i64 {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO knowledge_units
+                (note_id, local_id, topic, objective, unit_type, importance, stage,
+                 cognitive_action, required_points_json, claim_ids_json, evidence_json,
+                 reason, generated, due, introduced_at, position)
+             VALUES (?1, ?2, ?3, ?4, 'concept', 'core', 'foundation', 'recall',
+                     json_array(?4), '[]', json_array(?4), '测试单元', 1, ?5, ?5, ?6)
+             RETURNING id",
+        )
+        .bind(note_id)
+        .bind(local_id)
+        .bind(objective)
+        .bind(objective)
+        .bind(now)
+        .bind(1_i64)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get("id")
+    }
 
     #[tokio::test]
     async fn due_scope_combines_multiple_groups() {
@@ -223,17 +211,7 @@ mod tests {
             let note_id = db::notes::create_in_group(&pool, group_id, title, title)
                 .await
                 .unwrap();
-            db::cards::insert(
-                &pool,
-                &Card::new(
-                    note_id,
-                    format!("{title}问题"),
-                    format!("{title}答案"),
-                    None,
-                ),
-            )
-            .await
-            .unwrap();
+            insert_active_unit(&pool, note_id, "K1", title).await;
         }
 
         let filtered = due_in_scope(&pool, Utc::now(), &[rust_group, database_group], None)
@@ -256,17 +234,7 @@ mod tests {
         let note_id = db::notes::create(&pool, "Rust 所有权", "所有权规则与借用")
             .await
             .unwrap();
-        let card_id = db::cards::insert(
-            &pool,
-            &Card::new(
-                note_id,
-                "所有权转移后原变量还能使用吗？".into(),
-                "不能，除非类型实现 Copy。".into(),
-                Some("赋值会移动所有权。".into()),
-            ),
-        )
-        .await
-        .unwrap();
+        insert_active_unit(&pool, note_id, "K1", "所有权转移后原变量还能使用吗？").await;
         let item = due_in_scope(&pool, Utc::now(), &[], None)
             .await
             .unwrap()
@@ -337,7 +305,7 @@ mod tests {
         assert_eq!(unit.get::<String, _>("due"), due.to_rfc3339());
 
         let attempt = sqlx::query(
-            "SELECT prompt_id, seed_card_id, user_answer, ai_feedback, rating
+            "SELECT prompt_id, user_answer, ai_feedback, rating
              FROM review_attempts WHERE knowledge_unit_id = ?1",
         )
         .bind(item.unit_id)
@@ -345,15 +313,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempt.get::<i64, _>("prompt_id"), prompt_id);
-        assert_eq!(attempt.get::<i64, _>("seed_card_id"), card_id);
         assert_eq!(attempt.get::<String, _>("user_answer"), "不可以");
         assert_eq!(attempt.get::<String, _>("ai_feedback"), "回答正确");
         assert_eq!(attempt.get::<i64, _>("rating"), Rating::Good as i64);
-
-        let card = db::cards::get(&pool, card_id).await.unwrap().unwrap();
-        assert_eq!(card.reps, 1);
-        assert_eq!(card.due, due);
-        assert_eq!(db::reviews::by_card(&pool, card_id).await.unwrap().len(), 1);
 
         sqlx::raw_sql(
             "CREATE TRIGGER reject_forced_attempt

@@ -202,15 +202,18 @@ pub async fn describe_images(
     let mut described = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
         cancellation.ensure_active()?;
-        progress(ImportEvent::Stage(ImportProgress::stage(
-            ImportStage::DescribingImages,
-            format!(
-                "正在识别图片 {}/{}：{}",
-                index + 1,
-                images.len(),
-                image.relative_path.display()
-            ),
-        )));
+        progress(ImportEvent::Stage(
+            ImportProgress::stage(
+                ImportStage::DescribingImages,
+                format!(
+                    "正在识别图片 {}/{}：{}",
+                    index + 1,
+                    images.len(),
+                    image.relative_path.display()
+                ),
+            )
+            .with_counts(index, images.len()),
+        ));
         let bytes = fs::read(&image.path)
             .map_err(|error| anyhow!("读取图片 {} 失败: {error}", image.path.display()))?;
         let value = client
@@ -227,6 +230,13 @@ pub async fn describe_images(
         described.push(DescribedImage {
             source: image.clone(),
             description,
+        });
+        progress(ImportEvent::ItemCompleted {
+            stage: ImportStage::DescribingImages,
+            index: index + 1,
+            total: images.len(),
+            label: format!("图片 {}/{}", index + 1, images.len()),
+            summary: image.relative_path.display().to_string(),
         });
     }
     Ok(described)

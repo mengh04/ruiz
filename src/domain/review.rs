@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// 对一次作答的评分，对应 FSRS 的 1-4 档（Anki 的 Again/Hard/Good/Easy）。
@@ -22,16 +21,4 @@ impl Rating {
             _ => None,
         }
     }
-}
-
-/// 一次答题记录：用户的答案 + AI 判官的反馈 + 评分。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Review {
-    pub id: i64,
-    pub card_id: i64,
-    pub user_answer: String,
-    /// AI 判官给出的建议（为什么对/错、怎么改进）
-    pub ai_feedback: String,
-    pub rating: Rating,
-    pub reviewed_at: DateTime<Utc>,
 }
