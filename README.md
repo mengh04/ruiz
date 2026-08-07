@@ -1,73 +1,52 @@
-[中文](./README.md) · [English](./README_EN.md)
+<p align="center">
+  <img src="./assets/brand/logo.svg" alt="Ruiz Logo" width="112" />
+</p>
 
-# Ruiz
+<h1 align="center">Ruiz</h1>
 
-一个基于 [gpui](https://github.com/zed-industries/zed) 的 AI 学习记忆桌面应用：把任意学习材料交给 AI 智能导入，自动整理成知识蓝图并生成复习卡片，再用 [FSRS](https://github.com/open-spaced-repetition/fsrs4anki/wiki) 间隔重复算法安排复习，让记忆事半功倍。
+<p align="center">面向自主学习的 AI 记忆桌面应用</p>
 
-> 开发中项目（WIP）喵～ 功能与界面仍在快速迭代中。
+<p align="center">
+  <a href="./README.md">中文</a> · <a href="./README_EN.md">English</a>
+</p>
 
-## 功能特性
+Ruiz 可以将学习材料整理为清晰的知识结构，并结合智能出题与间隔重复，帮助你更高效地理解、记忆和复习内容。
 
-- **AI 智能导入**：粘贴或导入学习材料后，AI 自动完成「清洗网页噪声 → 归并并命名材料 → 提取知识单元 → 整理知识蓝图 → 准备复习内容」的完整流水线，整个过程**实时流式显示阶段进度**，可随时取消且不会写入半成品数据。
-- **知识蓝图**：导入的材料会被解析为知识单元（含主题、学习目标、重要度、认知动作等），为复习生成提供结构化依据。
-- **知识单元驱动**：复习围绕 AI 推荐的知识单元进行，静态题面仅在动态出题失败时作为内部备用。
-- **动态复习**：复习时 AI 会根据知识单元熟练度自适应生成**选择题、填空题、应用题**等动态题型；也可以关闭自适应，统一使用自由输入的简答题。
-- **FSRS 间隔重复**：基于 FSRS 调度器安排每张卡片的复习排期（稳定度 / 难度 / 到期时间），科学安排复习节奏。
-- **学习小组**：用学习小组组织笔记，支持将笔记移动到不同小组。
-- **本地存储**：所有数据保存在本地 SQLite 数据库中，无需联网即可复习。
+> [!NOTE]
+> Ruiz 目前仍处于开发阶段，功能和界面可能随版本更新而调整。
 
-## 技术栈
+## 主要功能
 
-| 组件 | 说明 |
-| --- | --- |
-| [Rust](https://www.rust-lang.org/) | 2024 edition |
-| [gpui](https://github.com/zed-industries/zed) | Zed 团队的高性能 UI 框架 |
-| [gpui-component](https://github.com/longbridge/gpui-component) | gpui 组件库（按钮、对话框、侧边栏等） |
-| [sqlx](https://github.com/launchbadge/sqlx) | SQLite 数据库（异步） |
-| [fsrs](https://github.com/open-spaced-repetition/fsrs-rs) | 间隔重复调度算法 |
-| [reqwest](https://github.com/seanmonstar/reqwest) | OpenAI 兼容 API 的 SSE 流式请求 |
-| [tokio](https://github.com/tokio-rs/tokio) | 异步运行时 |
+- **智能导入**：粘贴或导入学习材料，由 AI 自动整理内容。
+- **知识蓝图**：从材料中提炼知识单元，形成结构化的学习脉络。
+- **动态复习**：根据掌握情况生成不同类型的复习题目。
+- **间隔重复**：自动安排复习时间，帮助巩固长期记忆。
+- **学习管理**：通过学习小组组织笔记与学习资料。
+- **本地保存**：学习数据保存在本地，便于持续管理和复习。
 
-## 环境要求
+## 使用前准备
 
-- Rust 工具链（支持 2024 edition，建议使用最新 stable：`rustup update stable`）
-- 由于依赖 zed 的 `gpui` 等 git 依赖，**首次编译需要较长时间**，请耐心等待
-- Linux 下需要安装 gpui 运行所需的系统库（参考 [zed 仓库](https://github.com/zed-industries/zed) 的系统依赖要求）
+- 安装最新稳定版 [Rust](https://www.rust-lang.org/tools/install)。
+- 准备用于 AI 功能的 DeepSeek API Key。
+- Linux 用户需安装 [Zed](https://github.com/zed-industries/zed/blob/main/docs/src/development/linux.md) 构建所需的系统依赖。
 
 ## 构建与运行
+
+克隆项目后，在项目根目录运行：
 
 ```bash
 cargo run --release
 ```
 
+首次构建需要下载并编译依赖，可能需要一些时间。
+
 ## 快速开始
 
-1. 启动应用后，在**设置页**填入你的 DeepSeek API Key（默认使用 `deepseek-v4-flash` 模型，也可切换为 `deepseek-v4-pro`）。
-2. 在**笔记页**粘贴或导入一篇学习材料。
-3. 点击导入，AI 智能导入流水线开始运行：可展开任务面板实时查看「清洗、归并、提取、整理蓝图、生成卡片」等阶段进度。
-4. 流水线完成后，资料库中会出现整理好的材料与知识蓝图。
-5. 在**复习页**按 FSRS 排期进行复习，AI 会根据熟练度动态出题。
+1. 启动 Ruiz，在设置页配置 DeepSeek API Key。
+2. 在笔记页粘贴或导入学习材料。
+3. 等待材料整理完成，在资料库中查看生成的知识内容。
+4. 前往复习页开始复习，并根据作答情况完成反馈。
 
-## 数据存储
+## 许可证
 
-数据库（SQLite）保存在系统数据目录，依次尝试：
-
-1. XDG 数据目录（`ProjectDirs`）
-2. `$XDG_DATA_HOME`
-3. `$HOME/.local/share`
-4. 系统临时目录
-
-全部不可用时回退到当前目录下的 `./ruiz-data`。
-
-## 路线图
-
-- [x] AI 智能导入流水线（SSE 流式进度、阶段展示、可取消）
-- [x] 学习小组与笔记管理
-- [x] 基于 AI 推荐知识单元的动态复习
-- [x] 动态复习：自适应 AI 出题（选择 / 填空 / 应用）
-- [ ] 任务面板中显示请求编号、模型输出增量与累计耗时
-- [ ] 日志与流式视图中的敏感字段统一脱敏
-
-## License
-
-[Apache-2.0](./LICENSE)
+本项目基于 [Apache License 2.0](./LICENSE) 开源。
