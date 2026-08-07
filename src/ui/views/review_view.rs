@@ -7,11 +7,11 @@ use gpui::{
     prelude::*, px,
 };
 use gpui_component::Disableable as _;
-use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_component::input::{Input, InputState};
+use gpui_component::notification::Notification;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_component::skeleton::Skeleton;
@@ -32,6 +32,7 @@ use crate::scheduler::Scheduler;
 use crate::settings::AppSettings;
 use crate::state::AppState;
 use crate::ui::components::{empty_state, page_header};
+use crate::ui::notifications;
 
 enum Phase {
     LoadingQueue,
@@ -88,8 +89,6 @@ pub struct ReviewView {
     selected_option: Option<String>,
     phase: Phase,
     answer: Entity<InputState>,
-    error: Option<String>,
-    generation_notice: Option<String>,
     prefetched: Option<PreparedPrompt>,
     preparing_unit_id: Option<i64>,
     prefetching_unit_id: Option<i64>,
@@ -131,8 +130,6 @@ impl ReviewView {
             selected_option: None,
             phase: Phase::LoadingQueue,
             answer,
-            error: None,
-            generation_notice: None,
             prefetched: None,
             preparing_unit_id: None,
             prefetching_unit_id: None,
@@ -153,6 +150,16 @@ impl ReviewView {
         .detach();
         view.load(cx);
         view
+    }
+
+    fn notify(&self, notification: Notification, cx: &mut Context<Self>) {
+        notifications::push(self.window, notification, cx);
+    }
+
+    fn notify_generation_notice(&self, notice: Option<String>, cx: &mut Context<Self>) {
+        if let Some(notice) = notice {
+            self.notify(Notification::warning(notice).title("动态题生成提醒"), cx);
+        }
     }
 
     pub(crate) fn load(&mut self, cx: &mut Context<Self>) {
@@ -180,8 +187,6 @@ impl ReviewView {
         self.prefetched = None;
         self.preparing_unit_id = None;
         self.prefetching_unit_id = None;
-        self.error = None;
-        self.generation_notice = None;
         cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
@@ -265,7 +270,10 @@ impl ReviewView {
                                 if this.load_revision != revision {
                                     return;
                                 }
-                                this.error = Some(format!("加载复习队列失败: {error}"));
+                                this.notify(
+                                    Notification::error(format!("加载复习队列失败: {error}")),
+                                    cx,
+                                );
                                 this.queue_loading = false;
                                 this.phase = Phase::Finished;
                                 cx.notify();
@@ -295,7 +303,7 @@ impl ReviewView {
         }) {
             let prepared = self.prefetched.take().expect("已检查预生成题目");
             self.prompt = Some(prepared.prompt);
-            self.generation_notice = prepared.notice;
+            self.notify_generation_notice(prepared.notice, cx);
             self.phase = Phase::Answering;
             self.prefetch_next(cx);
             cx.notify();
@@ -322,7 +330,6 @@ impl ReviewView {
         self.prompt = None;
         self.selected_option = None;
         self.show_source = false;
-        self.generation_notice = None;
         cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
@@ -354,7 +361,7 @@ impl ReviewView {
                                     == Some(prepared.prompt.unit_id)
                                 {
                                     this.prompt = Some(prepared.prompt);
-                                    this.generation_notice = prepared.notice;
+                                    this.notify_generation_notice(prepared.notice, cx);
                                     this.phase = Phase::Answering;
                                     this.prefetch_next(cx);
                                     cx.notify();
@@ -370,7 +377,10 @@ impl ReviewView {
                                     return;
                                 }
                                 this.preparing_unit_id = None;
-                                this.error = Some(format!("准备动态题目失败: {error}"));
+                                this.notify(
+                                    Notification::error(format!("准备动态题目失败: {error}")),
+                                    cx,
+                                );
                                 this.phase = Phase::Finished;
                                 cx.notify();
                             })
@@ -438,7 +448,7 @@ impl ReviewView {
                                     && this.prompt.is_none()
                                 {
                                     this.prompt = Some(prepared.prompt);
-                                    this.generation_notice = prepared.notice;
+                                    this.notify_generation_notice(prepared.notice, cx);
                                     this.phase = Phase::Answering;
                                     this.prefetch_next(cx);
                                     cx.notify();
@@ -496,7 +506,6 @@ impl ReviewView {
     fn select_option(&mut self, option: String, cx: &mut Context<Self>) {
         if matches!(self.phase, Phase::Answering) {
             self.selected_option = Some(option);
-            self.error = None;
             cx.notify();
         }
     }
@@ -509,8 +518,10 @@ impl ReviewView {
             return;
         };
         let Some(ai) = AppState::global(cx).ai.clone() else {
-            self.error = Some("请先在「设置」里配置 DeepSeek API 密钥".into());
-            cx.notify();
+            self.notify(
+                Notification::error("请先在「设置」里配置 DeepSeek API 密钥"),
+                cx,
+            );
             return;
         };
         let user_answer = if prompt.format == QuestionFormat::Choice {
@@ -519,16 +530,15 @@ impl ReviewView {
             self.answer.read(cx).value().to_string()
         };
         if user_answer.trim().is_empty() {
-            self.error = Some(if prompt.format == QuestionFormat::Choice {
-                "请先选择一个答案".into()
+            let message = if prompt.format == QuestionFormat::Choice {
+                "请先选择一个答案"
             } else {
-                "答案不能为空".into()
-            });
-            cx.notify();
+                "答案不能为空"
+            };
+            self.notify(Notification::warning(message), cx);
             return;
         }
         self.phase = Phase::Judging;
-        self.error = None;
         self.submitted_answer = user_answer.clone();
         let revision = self.load_revision;
         let unit_id = item.unit_id;
@@ -565,7 +575,10 @@ impl ReviewView {
                                     Ok(next) => this.phase = Phase::Judged { judgement, next },
                                     Err(error) => {
                                         this.phase = Phase::Answering;
-                                        this.error = Some(format!("FSRS 计算失败: {error}"));
+                                        this.notify(
+                                            Notification::error(format!("FSRS 计算失败: {error}")),
+                                            cx,
+                                        );
                                     }
                                 }
                                 cx.notify();
@@ -586,10 +599,13 @@ impl ReviewView {
                                     return;
                                 }
                                 this.phase = Phase::Answering;
-                                this.error = Some(format!(
-                                    "判官调用失败: {error}\n{}",
-                                    crate::diagnostics::log_hint()
-                                ));
+                                this.notify(
+                                    Notification::error(format!(
+                                        "判官调用失败: {error}\n{}",
+                                        crate::diagnostics::log_hint()
+                                    )),
+                                    cx,
+                                );
                                 cx.notify();
                             })
                             .ok();
@@ -631,7 +647,6 @@ impl ReviewView {
         let completed_unit_id = item.unit_id;
         let revision = self.load_revision;
         self.phase = Phase::Scheduling;
-        self.error = None;
         cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<ReviewView>, cx: &mut gpui::AsyncApp| {
@@ -690,7 +705,10 @@ impl ReviewView {
                                     judgement: retry_judgement,
                                     next: retry_next,
                                 };
-                                this.error = Some(format!("保存复习记录失败: {error}"));
+                                this.notify(
+                                    Notification::error(format!("保存复习记录失败: {error}")),
+                                    cx,
+                                );
                                 cx.notify();
                             })
                             .ok();
@@ -1211,46 +1229,23 @@ impl Render for ReviewView {
             }
         };
 
-        let error = self.error.clone().map(|message| {
-            Alert::error("review-alert", message)
-                .banner()
-                .on_close(cx.listener(|this, _, _, cx| {
-                    this.error = None;
-                    cx.notify();
-                }))
-        });
-        let notice = self.generation_notice.clone().map(|message| {
-            Alert::warning("generation-notice", message)
-                .banner()
-                .on_close(cx.listener(|this, _, _, cx| {
-                    this.generation_notice = None;
-                    cx.notify();
-                }))
-        });
-
-        v_flex()
-            .size_full()
-            .child(header)
-            .child(scope_bar)
-            .children(error)
-            .children(notice)
-            .child(
-                div()
-                    .id("review-scroll-wrap")
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(
-                        div()
-                            .id("review-scroll")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .child(body),
-                    )
-                    .vertical_scrollbar(&self.scroll),
-            )
+        v_flex().size_full().child(header).child(scope_bar).child(
+            div()
+                .id("review-scroll-wrap")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(
+                    div()
+                        .id("review-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .child(body),
+                )
+                .vertical_scrollbar(&self.scroll),
+        )
     }
 }
 

@@ -10,6 +10,7 @@ use crate::ai::client::{DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL};
 pub struct Config {
     pub ai: AiConfig,
     pub review: ReviewConfig,
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +47,12 @@ pub struct ReviewConfig {
     /// 启用后按知识单元熟练度生成选择、填空和应用题等动态题型。
     /// 关闭时统一生成自由输入的简答题。
     pub adaptive_answer_formats: bool,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub sidebar_collapsed: bool,
 }
 
 pub fn load_config() -> Config {
@@ -126,6 +133,7 @@ mod tests {
         assert_eq!(config.ai.api_key.as_deref(), Some("secret"));
         assert_eq!(config.ai.model, DEEPSEEK_FLASH_MODEL);
         assert!(!config.review.adaptive_answer_formats);
+        assert!(!config.ui.sidebar_collapsed);
         assert!(serde_json::to_value(config).unwrap()["ai"]["api_base"].is_null());
     }
 }

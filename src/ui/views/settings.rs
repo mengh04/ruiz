@@ -4,6 +4,7 @@ use gpui_component::{
     button::Button,
     group_box::GroupBoxVariant,
     h_flex,
+    notification::Notification,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     switch::Switch,
     tag::{Tag, TagVariant},
@@ -236,9 +237,10 @@ impl SettingsView {
                                     .disabled(options.disabled)
                                     .on_click(|_, window, cx| {
                                         match crate::diagnostics::open_log_directory() {
-                                            Ok(()) => {
-                                                window.push_notification("已打开诊断日志目录", cx)
-                                            }
+                                            Ok(()) => window.push_notification(
+                                                Notification::success("已打开诊断日志目录"),
+                                                cx,
+                                            ),
                                             Err(error) => {
                                                 crate::diagnostics::error(
                                                     "diagnostics.open_failed",
@@ -248,7 +250,9 @@ impl SettingsView {
                                                     }),
                                                 );
                                                 window.push_notification(
-                                                    format!("打开日志目录失败: {error}"),
+                                                    Notification::error(format!(
+                                                        "打开日志目录失败: {error}"
+                                                    )),
                                                     cx,
                                                 );
                                             }

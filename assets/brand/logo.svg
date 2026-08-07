@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Ruiz Mastery Ring</title>
+  <desc id="desc">Two layered study cards with a mastery check and progress ring.</desc>
+  <rect x="35" y="45" width="428" height="431" rx="68" fill="#A94F51" transform="rotate(-3 35 45)"/>
+  <rect x="42" y="36" width="428" height="440" rx="68" fill="#F7FAF8"/>
+  <circle cx="256" cy="256" r="137" fill="none" stroke="#DDE6E4" stroke-width="42"/>
+  <path d="M256 119a137 137 0 1 1-130 93" fill="none" stroke="#18A596" stroke-width="42" stroke-linecap="round"/>
+  <path d="m190 260 48 46 92-105" fill="none" stroke="#17324D" stroke-width="38" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

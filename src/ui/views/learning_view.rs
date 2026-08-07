@@ -1,6 +1,6 @@
 use gpui::{
-    Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Window, div, point,
-    prelude::*, px, relative,
+    AnyWindowHandle, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Window, div,
+    point, prelude::*, px, relative,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -8,6 +8,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
+    notification::Notification,
     scroll::ScrollableElement as _,
     spinner::Spinner,
     text::markdown,
@@ -29,6 +30,7 @@ use crate::{
         note::Note,
     },
     state::AppState,
+    ui::notifications,
 };
 
 pub struct LearningView {
@@ -54,7 +56,8 @@ pub struct LearningView {
     loading_prompt: bool,
     prefetching_prompt_step_id: Option<i64>,
     busy: bool,
-    error: Option<String>,
+    load_error: Option<String>,
+    window: AnyWindowHandle,
     content_scroll: ScrollHandle,
     outline_scroll: ScrollHandle,
 }
@@ -96,12 +99,17 @@ impl LearningView {
             loading_prompt: false,
             prefetching_prompt_step_id: None,
             busy: false,
-            error: None,
+            load_error: None,
+            window: window.window_handle(),
             content_scroll: ScrollHandle::new(),
             outline_scroll: ScrollHandle::new(),
         };
         view.load(cx);
         view
+    }
+
+    fn notify(&self, notification: Notification, cx: &mut Context<Self>) {
+        notifications::push(self.window, notification, cx);
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -171,7 +179,7 @@ impl LearningView {
                             }
                             Err(error) => {
                                 this.loading = false;
-                                this.error = Some(format!("准备学习路线失败: {error:#}"));
+                                this.load_error = Some(format!("准备学习路线失败: {error:#}"));
                             }
                         }
                         cx.notify();
@@ -215,7 +223,7 @@ impl LearningView {
             return;
         }
         let Some(step_id) = step.id else {
-            self.error = Some("理解检查尚未保存".into());
+            self.notify(Notification::error("理解检查尚未保存"), cx);
             return;
         };
         if self.prefetching_prompt_step_id == Some(step_id) {
@@ -248,7 +256,7 @@ impl LearningView {
     fn prepare_prompt(&mut self, step: LearningStep, foreground: bool, cx: &mut Context<Self>) {
         let Some(step_id) = step.id else {
             if foreground {
-                self.error = Some("理解检查尚未保存".into());
+                self.notify(Notification::error("理解检查尚未保存"), cx);
             }
             return;
         };
@@ -328,9 +336,10 @@ impl LearningView {
                                     this.prompts = prompts;
                                     this.current_prompt_index = 0;
                                 }
-                                Err(error) => {
-                                    this.error = Some(format!("准备理解检查失败: {error:#}"))
-                                }
+                                Err(error) => this.notify(
+                                    Notification::error(format!("准备理解检查失败: {error:#}")),
+                                    cx,
+                                ),
                             }
                         } else if let Err(error) = result {
                             crate::diagnostics::warn(
@@ -356,7 +365,7 @@ impl LearningView {
             return;
         };
         if step.id.is_none() {
-            self.error = Some("主题回顾尚未保存".into());
+            self.notify(Notification::error("主题回顾尚未保存"), cx);
             return;
         }
         let pool = AppState::global(cx).pool.clone();
@@ -393,7 +402,10 @@ impl LearningView {
                                 }
                             }
                             Err(error) => {
-                                this.error = Some(format!("准备主题回顾失败: {error:#}"));
+                                this.notify(
+                                    Notification::error(format!("准备主题回顾失败: {error:#}")),
+                                    cx,
+                                );
                             }
                         }
                         cx.notify();
@@ -440,7 +452,10 @@ impl LearningView {
                                 }
                                 this.prepare_current(cx);
                             }
-                            Err(error) => this.error = Some(format!("保存学习进度失败: {error:#}")),
+                            Err(error) => this.notify(
+                                Notification::error(format!("保存学习进度失败: {error:#}")),
+                                cx,
+                            ),
                         }
                         cx.notify();
                     })
@@ -468,8 +483,7 @@ impl LearningView {
             self.answer.read(cx).value().trim().to_string()
         };
         if answer.is_empty() {
-            self.error = Some("请先作答，或选择“不会”".into());
-            cx.notify();
+            self.notify(Notification::warning("请先作答，或选择“不会”"), cx);
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -482,7 +496,6 @@ impl LearningView {
         let client = AppState::global(cx).ai.clone();
         let assisted = self.remediation;
         self.busy = true;
-        self.error = None;
         cx.spawn(
             move |this: gpui::WeakEntity<LearningView>, cx: &mut gpui::AsyncApp| {
                 let mut cx = (*cx).clone();
@@ -560,10 +573,12 @@ impl LearningView {
                                     this.begin_remediation();
                                 }
                             }
-                            Err(error) => {
-                                this.error =
-                                    Some(format!("判分失败，回答已留在输入框中: {error:#}"))
-                            }
+                            Err(error) => this.notify(
+                                Notification::error(format!(
+                                    "判分失败，回答已留在输入框中: {error:#}"
+                                )),
+                                cx,
+                            ),
                         }
                         cx.notify();
                     })
@@ -600,7 +615,6 @@ impl LearningView {
         self.feedback = None;
         self.remediation = false;
         self.awaiting_continue = false;
-        self.error = None;
         self.answer
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.content_scroll.set_offset(point(px(0.), px(0.)));
@@ -691,7 +705,7 @@ impl Render for LearningView {
                 .child(Spinner::new())
                 .child("正在解析正文并编排学习路线…")
                 .into_any_element()
-        } else if let Some(error) = self.error.clone() {
+        } else if let Some(error) = self.load_error.clone() {
             v_flex()
                 .flex_1()
                 .items_center()

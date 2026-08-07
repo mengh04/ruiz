@@ -3,8 +3,6 @@
 use gpui::{AnyElement, App, SharedString, div, prelude::*, px};
 use gpui_component::{ActiveTheme as _, Icon, StyledExt as _, TitleBar, h_flex, v_flex};
 
-use crate::assets::RuizIcon;
-
 /// Ruiz 窗口共用的自绘标题栏。
 pub fn app_title_bar(section: impl Into<SharedString>, cx: &App) -> TitleBar {
     let colors = cx.theme().colors;
@@ -15,16 +13,6 @@ pub fn app_title_bar(section: impl Into<SharedString>, cx: &App) -> TitleBar {
             .items_center()
             .gap_2()
             .text_sm()
-            .child(
-                h_flex()
-                    .size_5()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(colors.primary.opacity(0.12))
-                    .text_color(colors.primary)
-                    .child(Icon::new(RuizIcon::GraduationCap).size_3()),
-            )
             .child(div().font_semibold().child("Ruiz"))
             .child(div().text_color(colors.muted_foreground).child("/"))
             .child(

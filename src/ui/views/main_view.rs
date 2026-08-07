@@ -4,17 +4,18 @@ use gpui::{
 };
 
 use gpui_component::{
-    ActiveTheme as _, Icon, IconNamed, Root, Sizable as _, TitleBar,
+    ActiveTheme as _, IconNamed, Root, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     sidebar::{
-        Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu,
-        SidebarMenuItem, SidebarToggleButton,
+        Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarMenu, SidebarMenuItem,
+        SidebarToggleButton,
     },
     v_flex,
 };
 
 use crate::assets::RuizIcon;
+use crate::settings::{AppSettings, save_config};
 use crate::ui::components::app_title_bar;
 
 use super::{notes_view::NotesView, review_view::ReviewView, settings::SettingsView};
@@ -35,11 +36,12 @@ pub struct MainView {
 
 impl MainView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let sidebar_collapsed = AppSettings::global(cx).settings.ui.sidebar_collapsed;
         Self {
             active: Tab::Notes,
             notes: cx.new(|cx| NotesView::new(window, cx)),
             review: cx.new(|cx| ReviewView::new(window, cx)),
-            sidebar_collapsed: false,
+            sidebar_collapsed,
         }
     }
 
@@ -53,6 +55,18 @@ impl MainView {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        let config = {
+            let settings = AppSettings::global_mut(cx);
+            settings.settings.ui.sidebar_collapsed = self.sidebar_collapsed;
+            settings.settings.clone()
+        };
+        if let Err(error) = save_config(&config) {
+            crate::diagnostics::error(
+                "settings.sidebar.save_failed",
+                "Failed to persist sidebar state",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        }
         cx.notify();
     }
 
@@ -124,37 +138,6 @@ impl Render for MainView {
         ]));
 
         let sidebar_collapsed = self.sidebar_collapsed;
-        let header = SidebarHeader::new()
-            .child(
-                h_flex()
-                    .size_8()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().primary)
-                    .text_color(cx.theme().primary_foreground)
-                    .when(!sidebar_collapsed, |this| {
-                        this.child(Icon::new(RuizIcon::GraduationCap))
-                    })
-                    .when(sidebar_collapsed, |this| {
-                        this.size_4()
-                            .bg(cx.theme().transparent)
-                            .text_color(cx.theme().foreground)
-                            .child(Icon::new(RuizIcon::GraduationCap))
-                    }),
-            )
-            .when(!sidebar_collapsed, |this| {
-                this.child(
-                    v_flex().min_w_0().flex_1().gap_0().child("Ruiz").child(
-                        v_flex()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("学习与间隔复习"),
-                    ),
-                )
-            });
-
         let settings_view = view.clone();
         let settings_button = Button::new("open-settings")
             .small()
@@ -200,7 +183,6 @@ impl Render for MainView {
                         .w(px(208.))
                         .collapsible(SidebarCollapsible::Icon)
                         .collapsed(sidebar_collapsed)
-                        .header(header)
                         .child(navigation)
                         .footer(footer),
                 )

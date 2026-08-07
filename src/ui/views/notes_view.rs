@@ -9,13 +9,13 @@ use gpui::{
     prelude::*, px, relative, size,
 };
 use gpui_component::Disableable as _;
-use gpui_component::alert::Alert;
 use gpui_component::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::notification::Notification;
 use gpui_component::progress::ProgressCircle;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::searchable_list::SearchableVec;
@@ -39,6 +39,7 @@ use crate::domain::knowledge::{KnowledgeUnit, MaterialAnalysis};
 use crate::domain::note::Note;
 use crate::state::AppState;
 use crate::ui::components::{empty_state, page_header};
+use crate::ui::notifications;
 use crate::ui::views::learning_view::LearningView;
 
 pub struct NotesView {
@@ -71,7 +72,6 @@ pub struct NotesView {
     generating: bool,
     deleting_note_id: Option<i64>,
     resetting_learning: bool,
-    message: Option<Message>,
     /// 窗口句柄（清空输入框等窗口操作需要）
     window: AnyWindowHandle,
     /// 笔记列表滚动
@@ -96,14 +96,6 @@ impl NotesPage {
             Self::Detail(id) | Self::Reader(id) => Some(id),
         }
     }
-}
-
-/// 顶部的操作结果提示。
-#[derive(Clone)]
-enum Message {
-    Success(String),
-    Warning(String),
-    Error(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +166,6 @@ impl NotesView {
             generating: false,
             deleting_note_id: None,
             resetting_learning: false,
-            message: None,
             window: window_handle,
             notes_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
@@ -190,6 +181,10 @@ impl NotesView {
         view.refresh_notes(cx);
         view.refresh_groups(cx);
         view
+    }
+
+    fn notify(&self, notification: Notification, cx: &mut Context<Self>) {
+        notifications::push(self.window, notification, cx);
     }
 
     fn append_import_thinking(&mut self, text: &str) {
@@ -335,7 +330,7 @@ impl NotesView {
                         Err(e) => {
                             this.update(&mut cx, |this, cx| {
                                 this.notes_loading = false;
-                                this.message = Some(Message::Error(format!("加载笔记失败: {e}")));
+                                this.notify(Notification::error(format!("加载笔记失败: {e}")), cx);
                                 cx.notify();
                             })
                             .ok();
@@ -386,8 +381,10 @@ impl NotesView {
                             this.update(&mut cx, |this, cx| {
                                 if this.page.note_id() == Some(note_id) {
                                     this.detail_loading = false;
-                                    this.message =
-                                        Some(Message::Error(format!("加载知识蓝图失败: {e}")));
+                                    this.notify(
+                                        Notification::error(format!("加载知识蓝图失败: {e}")),
+                                        cx,
+                                    );
                                 }
                                 cx.notify();
                             })
@@ -404,12 +401,12 @@ impl NotesView {
         let pool = AppState::global(cx).pool.clone();
         let content = self.content.read(cx).value().to_string();
         if content.trim().is_empty() {
-            window.push_notification("请先粘贴学习材料", cx);
+            window.push_notification(Notification::warning("请先粘贴学习材料"), cx);
             cx.notify();
             return false;
         }
         let Some(ai) = AppState::global(cx).ai.clone() else {
-            window.push_notification("请先在设置中配置 AI", cx);
+            window.push_notification(Notification::error("请先在设置中配置 AI"), cx);
             return false;
         };
         let requested_group = self.group_name_input.read(cx).value().trim().to_string();
@@ -438,7 +435,6 @@ impl NotesView {
         self.import_started_at = Some(Instant::now());
         self.import_cancellation = Some(cancellation.clone());
         self.import_cancelling = false;
-        self.message = None;
         cx.notify();
         let content_input = self.content.clone();
         let window_handle = self.window;
@@ -574,12 +570,6 @@ impl NotesView {
                             );
                             cx.update_window(window_handle, move |_view, window, cx| {
                                 content_input.update(cx, |s, cx| s.set_value("", window, cx));
-                                window.push_notification(
-                                    format!(
-                                        "已导入 {material_count} 篇材料，准备 {question_count} 个复习知识点"
-                                    ),
-                                    cx,
-                                );
                             })
                             .ok();
                             this.update(&mut cx, |this, cx| {
@@ -595,9 +585,12 @@ impl NotesView {
                                 this.page = only_note
                                     .map(NotesPage::Detail)
                                     .unwrap_or(NotesPage::Library);
-                                this.message = Some(Message::Success(format!(
-                                    "AI 已整理出 {material_count} 篇材料，并准备 {question_count} 个复习知识点"
-                                )));
+                                this.notify(
+                                    Notification::success(format!(
+                                        "AI 已整理出 {material_count} 篇材料，并准备 {question_count} 个复习知识点"
+                                    )),
+                                    cx,
+                                );
                                 this.refresh_notes(cx);
                                 this.refresh_groups(cx);
                                 if only_note.is_some() {
@@ -631,16 +624,17 @@ impl NotesView {
                                 this.import_thinking_chars = 0;
                                 this.import_answer_preview.clear();
                                 this.import_answer_chars = 0;
-                                this.message = if was_cancelled {
-                                    Some(Message::Warning(
-                                        "已取消智能导入，临时结果未写入资料库".into(),
-                                    ))
+                                let notification = if was_cancelled {
+                                    Notification::warning(
+                                        "已取消智能导入，临时结果未写入资料库",
+                                    )
                                 } else {
-                                    Some(Message::Error(format!(
+                                    Notification::error(format!(
                                         "智能导入失败: {e}\n{}",
                                         crate::diagnostics::log_hint()
-                                    )))
+                                    ))
                                 };
+                                this.notify(notification, cx);
                                 cx.notify();
                             })
                             .ok();
@@ -691,8 +685,10 @@ impl NotesView {
             return;
         };
         if self.units.is_empty() {
-            self.message = Some(Message::Warning("请先建立知识蓝图，再开始引导学习".into()));
-            cx.notify();
+            self.notify(
+                Notification::warning("请先建立知识蓝图，再开始引导学习"),
+                cx,
+            );
             return;
         }
         let analysis = self.analysis.clone();
@@ -776,7 +772,6 @@ impl NotesView {
         }
         let pool = AppState::global(cx).pool.clone();
         self.resetting_learning = true;
-        self.message = None;
         cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
@@ -788,14 +783,17 @@ impl NotesView {
                     .await;
                     this.update(&mut cx, |this, cx| {
                         this.resetting_learning = false;
-                        this.message = Some(match result {
+                        let notification = match result {
                             Ok(_) => {
                                 this.learning_session_exists = false;
                                 this.can_resume_learning = false;
-                                Message::Success("学习进度已重置，下次将从第一步开始".into())
+                                Notification::success("学习进度已重置，下次将从第一步开始")
                             }
-                            Err(error) => Message::Error(format!("重置学习进度失败: {error:#}")),
-                        });
+                            Err(error) => {
+                                Notification::error(format!("重置学习进度失败: {error:#}"))
+                            }
+                        };
+                        this.notify(notification, cx);
                         cx.notify();
                     })
                     .ok();
@@ -897,7 +895,10 @@ impl NotesView {
                                     move |_, window, cx| {
                                         let name = save_input.read(cx).value().trim().to_string();
                                         if name.is_empty() {
-                                            window.push_notification("分组名称不能为空", cx);
+                                            window.push_notification(
+                                                Notification::warning("分组名称不能为空"),
+                                                cx,
+                                            );
                                             return;
                                         }
                                         window.close_dialog(cx);
@@ -914,7 +915,6 @@ impl NotesView {
 
     fn move_note_to_group(&mut self, note_id: i64, name: String, cx: &mut Context<Self>) {
         let pool = AppState::global(cx).pool.clone();
-        self.message = None;
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
@@ -930,14 +930,18 @@ impl NotesView {
                         match result {
                             Ok((group_id, name)) => {
                                 this.selected_group_id = Some(group_id);
-                                this.message =
-                                    Some(Message::Success(format!("笔记已移动到“{name}”分组")));
+                                this.notify(
+                                    Notification::success(format!("笔记已移动到“{name}”分组")),
+                                    cx,
+                                );
                                 this.refresh_notes(cx);
                                 this.refresh_groups(cx);
                             }
                             Err(error) => {
-                                this.message =
-                                    Some(Message::Error(format!("修改笔记分组失败: {error}")));
+                                this.notify(
+                                    Notification::error(format!("修改笔记分组失败: {error}")),
+                                    cx,
+                                );
                             }
                         }
                         cx.notify();
@@ -1028,12 +1032,18 @@ impl NotesView {
                                         let Some(group_id) =
                                             save_select.read(cx).selected_value().copied()
                                         else {
-                                            window.push_notification("请先选择分组", cx);
+                                            window.push_notification(
+                                                Notification::warning("请先选择分组"),
+                                                cx,
+                                            );
                                             return;
                                         };
                                         let name = save_input.read(cx).value().trim().to_string();
                                         if name.is_empty() {
-                                            window.push_notification("分组名称不能为空", cx);
+                                            window.push_notification(
+                                                Notification::warning("分组名称不能为空"),
+                                                cx,
+                                            );
                                             return;
                                         }
                                         window.close_dialog(cx);
@@ -1050,7 +1060,6 @@ impl NotesView {
 
     fn rename_group(&mut self, group_id: i64, name: String, cx: &mut Context<Self>) {
         let pool = AppState::global(cx).pool.clone();
-        self.message = None;
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
                 let this = this.clone();
@@ -1065,13 +1074,17 @@ impl NotesView {
                         match result {
                             Ok(name) => {
                                 this.selected_group_id = Some(group_id);
-                                this.message =
-                                    Some(Message::Success(format!("分组已重命名为“{name}”")));
+                                this.notify(
+                                    Notification::success(format!("分组已重命名为“{name}”")),
+                                    cx,
+                                );
                                 this.refresh_groups(cx);
                             }
                             Err(error) => {
-                                this.message =
-                                    Some(Message::Error(format!("重命名分组失败: {error}")));
+                                this.notify(
+                                    Notification::error(format!("重命名分组失败: {error}")),
+                                    cx,
+                                );
                             }
                         }
                         cx.notify();
@@ -1296,7 +1309,6 @@ impl NotesView {
         }
         let pool = AppState::global(cx).pool.clone();
         self.deleting_note_id = Some(note_id);
-        self.message = None;
         cx.notify();
         cx.spawn(
             move |this: gpui::WeakEntity<NotesView>, cx: &mut gpui::AsyncApp| {
@@ -1317,7 +1329,7 @@ impl NotesView {
                                     this.units.clear();
                                     this.detail_loading = false;
                                 }
-                                this.message = Some(Message::Success("笔记已删除".into()));
+                                this.notify(Notification::success("笔记已删除"), cx);
                                 this.refresh_notes(cx);
                                 cx.notify();
                             })
@@ -1326,8 +1338,10 @@ impl NotesView {
                         Err(error) => {
                             this.update(&mut cx, |this, cx| {
                                 this.deleting_note_id = None;
-                                this.message =
-                                    Some(Message::Error(format!("删除笔记失败: {error}")));
+                                this.notify(
+                                    Notification::error(format!("删除笔记失败: {error}")),
+                                    cx,
+                                );
                                 cx.notify();
                             })
                             .ok();
@@ -1342,18 +1356,17 @@ impl NotesView {
     /// 为旧笔记补建蓝图，并为 AI 推荐的知识单元准备复习降级数据。
     fn generate(&mut self, cx: &mut Context<Self>) {
         let Some(note_id) = self.page.note_id() else {
-            self.message = Some(Message::Error("请先选中一篇笔记".into()));
-            cx.notify();
+            self.notify(Notification::error("请先选中一篇笔记"), cx);
             return;
         };
         let Some(note) = self.notes.iter().find(|n| n.id == note_id) else {
             return;
         };
         let Some(ai) = AppState::global(cx).ai.clone() else {
-            self.message = Some(Message::Error(
-                "请先在「设置」里配置 DeepSeek API 密钥".into(),
-            ));
-            cx.notify();
+            self.notify(
+                Notification::error("请先在「设置」里配置 DeepSeek API 密钥"),
+                cx,
+            );
             return;
         };
         let has_analysis = self.analysis.is_some();
@@ -1364,15 +1377,13 @@ impl NotesView {
             .cloned()
             .collect::<Vec<_>>();
         if has_analysis && remaining_units.is_empty() {
-            self.message = Some(Message::Success("复习内容已经准备完成".into()));
-            cx.notify();
+            self.notify(Notification::success("复习内容已经准备完成"), cx);
             return;
         }
         let title = note.title.clone();
         let content = note.content.clone();
         let pool = AppState::global(cx).pool.clone();
         self.generating = true;
-        self.message = None;
         cx.notify();
 
         cx.spawn(
@@ -1421,9 +1432,12 @@ impl NotesView {
                         Ok(n) => {
                             this.update(&mut cx, |this, cx| {
                                 this.generating = false;
-                                this.message = Some(Message::Success(format!(
-                                    "知识蓝图已更新，并准备 {n} 个复习知识点"
-                                )));
+                                this.notify(
+                                    Notification::success(format!(
+                                        "知识蓝图已更新，并准备 {n} 个复习知识点"
+                                    )),
+                                    cx,
+                                );
                                 this.refresh_detail(cx);
                                 cx.notify();
                             })
@@ -1437,10 +1451,13 @@ impl NotesView {
                             );
                             this.update(&mut cx, |this, cx| {
                                 this.generating = false;
-                                this.message = Some(Message::Error(format!(
-                                    "出题失败: {e}\n{}",
-                                    crate::diagnostics::log_hint()
-                                )));
+                                this.notify(
+                                    Notification::error(format!(
+                                        "出题失败: {e}\n{}",
+                                        crate::diagnostics::log_hint()
+                                    )),
+                                    cx,
+                                );
                                 cx.notify();
                             })
                             .ok();
@@ -1582,34 +1599,6 @@ impl Render for NotesView {
                 )
             }
         };
-
-        // 提示消息
-        let alerts = self.message.clone().map(|message| {
-            let alert: gpui::AnyElement = match message {
-                Message::Success(msg) => Alert::success("note-alert", msg)
-                    .banner()
-                    .on_close(cx.listener(|this, _, _, cx| {
-                        this.message = None;
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                Message::Warning(msg) => Alert::warning("note-alert", msg)
-                    .banner()
-                    .on_close(cx.listener(|this, _, _, cx| {
-                        this.message = None;
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                Message::Error(msg) => Alert::error("note-alert", msg)
-                    .banner()
-                    .on_close(cx.listener(|this, _, _, cx| {
-                        this.message = None;
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            };
-            div().px_6().pt_4().child(alert)
-        });
 
         let library_filters = self.library_group_filters.clone();
         let visible_note_count = self
@@ -2058,61 +2047,51 @@ impl Render for NotesView {
                 } else {
                     "建立知识蓝图".to_string()
                 };
-                let generate_bar = GroupBox::new()
-                    .outline()
-                    .title(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Icon::new(RuizIcon::Sparkles).size_4())
-                            .child("AI 学习蓝图"),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .when(self.analysis.is_none(), |this| {
-                                this.child(
+                let generate_bar = should_show_generate_bar(
+                    self.analysis.is_some(),
+                    remaining_count,
+                    self.generating,
+                )
+                .then(|| {
+                    GroupBox::new()
+                        .outline()
+                        .title(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Icon::new(RuizIcon::Sparkles).size_4())
+                                .child("AI 学习蓝图"),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .when(self.analysis.is_none(), |this| {
+                                    this.child(
                                     div().text_sm().text_color(colors.muted_foreground).child(
                                         "这篇材料还没有知识蓝图，可以让 AI 提取适合复习的知识点。",
                                     ),
                                 )
-                            })
-                            .when_some(self.analysis.as_ref(), |this, analysis| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(colors.muted_foreground)
-                                        .child(SharedString::from(analysis.summary.clone())),
-                                )
-                            })
-                            .when(
-                                self.analysis
-                                    .as_ref()
-                                    .is_some_and(|analysis| !analysis.warnings.is_empty()),
-                                |this| {
-                                    let warnings = self
-                                        .analysis
-                                        .as_ref()
-                                        .map(|analysis| analysis.warnings.join("\n"))
-                                        .unwrap_or_default();
-                                    this.child(Alert::warning("analysis-warning", warnings))
-                                },
-                            )
-                            .child(
-                                Button::new("btn-generate")
-                                    .icon(RuizIcon::Sparkles)
-                                    .label(generate_label)
-                                    .primary()
-                                    .loading(self.generating)
-                                    .disabled(
-                                        self.generating
-                                            || self.detail_loading
-                                            || (self.analysis.is_some() && remaining_count == 0),
+                                })
+                                .when_some(self.analysis.as_ref(), |this, analysis| {
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(colors.muted_foreground)
+                                            .child(SharedString::from(analysis.summary.clone())),
                                     )
-                                    .when(compact, |this| this.w_full())
-                                    .on_click(cx.listener(|this, _, _, cx| this.generate(cx))),
-                            ),
-                    );
+                                })
+                                .child(
+                                    Button::new("btn-generate")
+                                        .icon(RuizIcon::Sparkles)
+                                        .label(generate_label)
+                                        .primary()
+                                        .loading(self.generating)
+                                        .disabled(self.generating || self.detail_loading)
+                                        .when(compact, |this| this.w_full())
+                                        .on_click(cx.listener(|this, _, _, cx| this.generate(cx))),
+                                ),
+                        )
+                });
 
                 let blueprint = if self.units.is_empty() {
                     div().into_any_element()
@@ -2367,7 +2346,7 @@ impl Render for NotesView {
                                     ),
                             ),
                     )
-                    .child(generate_bar)
+                    .children(generate_bar)
                     .child(blueprint)
                     .into_any_element()
             } else {
@@ -2413,13 +2392,7 @@ impl Render for NotesView {
                     cx.stop_propagation();
                 }),
             )
-            .child(
-                v_flex()
-                    .size_full()
-                    .child(header)
-                    .children(alerts)
-                    .child(page),
-            )
+            .child(v_flex().size_full().child(header).child(page))
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)
@@ -2484,12 +2457,16 @@ fn matches_group_filter(group_id: i64, selected_group_ids: &[i64]) -> bool {
     selected_group_ids.is_empty() || selected_group_ids.contains(&group_id)
 }
 
+fn should_show_generate_bar(has_analysis: bool, remaining_count: usize, generating: bool) -> bool {
+    !has_analysis || remaining_count > 0 || generating
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use fsrs::MemoryState;
 
-    use super::{matches_group_filter, review_summary_label};
+    use super::{matches_group_filter, review_summary_label, should_show_generate_bar};
     use crate::domain::dynamic_review::ReviewState;
 
     #[test]
@@ -2501,6 +2478,14 @@ mod tests {
     fn multiple_group_filters_use_union_semantics() {
         assert!(matches_group_filter(2, &[1, 2, 3]));
         assert!(!matches_group_filter(4, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn completed_blueprint_hides_generate_bar() {
+        assert!(!should_show_generate_bar(true, 0, false));
+        assert!(should_show_generate_bar(false, 0, false));
+        assert!(should_show_generate_bar(true, 1, false));
+        assert!(should_show_generate_bar(true, 0, true));
     }
 
     #[test]
