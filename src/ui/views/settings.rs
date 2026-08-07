@@ -1,10 +1,12 @@
-use gpui::{Context, IntoElement, Render, div, prelude::*, px, rgb};
+use gpui::{Anchor, Context, IntoElement, Render, div, prelude::*, px, rgb};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
     button::Button,
     group_box::GroupBoxVariant,
     h_flex,
     notification::Notification,
+    popover::Popover,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     switch::Switch,
     tag::{Tag, TagVariant},
@@ -35,34 +37,54 @@ impl SettingsView {
                     .title("主题")
                     .description("主题会立即应用到所有 Ruiz 窗口，并在重启后保留。")
                     .items([
-                        SettingItem::new(
-                            "界面主题",
-                            SettingField::scrollable_dropdown(
-                                AppTheme::ALL
-                                    .into_iter()
-                                    .map(|theme| (theme.id().into(), theme.label().into()))
-                                    .collect(),
-                                |cx| AppSettings::global(cx).settings.ui.theme.id().into(),
-                                |value, cx| {
-                                    let Some(theme) = AppTheme::parse(value.as_ref()) else {
-                                        return;
-                                    };
-                                    AppSettings::global_mut(cx).settings.ui.theme = theme;
-                                    save_settings(cx);
-                                    if let Err(error) = crate::themes::apply(theme, cx) {
-                                        crate::diagnostics::error(
-                                            "theme.apply_failed",
-                                            "Failed to apply selected theme",
-                                            serde_json::json!({
-                                                "theme": theme.id(),
-                                                "error": format!("{error:#}"),
-                                            }),
-                                        );
+                        SettingItem::render(|options, _window, cx| {
+                            let saved = AppSettings::global(cx).settings.ui.theme;
+                            let active_theme_name = cx.theme().theme_name().clone();
+                            let trigger = Button::new("theme-picker-trigger")
+                                .label(saved.label())
+                                .dropdown_caret(true)
+                                .outline()
+                                .disabled(options.disabled);
+                            Popover::new("theme-picker-popover")
+                                .anchor(Anchor::TopRight)
+                                .trigger(trigger)
+                                .on_open_change(|open, _, cx| {
+                                    if !*open {
+                                        restore_saved_theme(cx);
                                     }
-                                },
-                            )
-                            .default_value(AppTheme::DefaultLight.id()),
-                        )
+                                })
+                                .content(move |_, _window, cx| {
+                                    let popover = cx.entity();
+                                    v_flex()
+                                        .id("theme-picker-options")
+                                        .w(px(280.))
+                                        .max_h(px(420.))
+                                        .overflow_y_scroll()
+                                        .gap_1()
+                                        .children(AppTheme::ALL.into_iter().map(|theme| {
+                                            let popover = popover.clone();
+                                            Button::new(theme.id())
+                                                .w_full()
+                                                .justify_start()
+                                                .label(theme.label())
+                                                .selected(
+                                                    active_theme_name.as_ref()
+                                                        == theme.registry_name(),
+                                                )
+                                                .on_hover(move |hovered, _, cx| {
+                                                    if *hovered {
+                                                        preview_theme(theme, cx);
+                                                    }
+                                                })
+                                                .on_click(move |_, window, cx| {
+                                                    select_theme(theme, cx);
+                                                    popover.update(cx, |state, cx| {
+                                                        state.dismiss(window, cx);
+                                                    });
+                                                })
+                                        }))
+                                })
+                        })
                         .description("内置 Ayu、Catppuccin、Gruvbox、Tokyo Night 和 Solarized。")
                         .keywords([
                             "theme",
@@ -393,4 +415,27 @@ fn save_settings(cx: &mut gpui::App) {
         );
         eprintln!("保存设置失败: {error}");
     }
+}
+
+fn preview_theme(theme: AppTheme, cx: &mut gpui::App) {
+    if let Err(error) = crate::themes::apply(theme, cx) {
+        crate::diagnostics::error(
+            "theme.preview_failed",
+            "Failed to preview theme",
+            serde_json::json!({
+                "theme": theme.id(),
+                "error": format!("{error:#}"),
+            }),
+        );
+    }
+}
+
+fn restore_saved_theme(cx: &mut gpui::App) {
+    preview_theme(AppSettings::global(cx).settings.ui.theme, cx);
+}
+
+fn select_theme(theme: AppTheme, cx: &mut gpui::App) {
+    AppSettings::global_mut(cx).settings.ui.theme = theme;
+    save_settings(cx);
+    preview_theme(theme, cx);
 }
