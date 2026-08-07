@@ -11,7 +11,7 @@ use gpui_component::{
     notification::Notification,
     scroll::ScrollableElement as _,
     spinner::Spinner,
-    text::markdown,
+    text::TextView,
     v_flex,
 };
 
@@ -883,9 +883,13 @@ impl LearningView {
                 v_flex()
                     .gap_5()
                     .children(blocks.into_iter().map(|block| {
-                        div()
-                            .text_color(colors.foreground)
-                            .child(markdown(block.source_text).selectable(true))
+                        div().text_color(colors.foreground).child(
+                            TextView::markdown(
+                                format!("learning-source-{}", block.local_id),
+                                block.source_text,
+                            )
+                            .selectable(true),
+                        )
                     }))
                     .child(if reviewing {
                         self.review_return_button(cx)
@@ -937,7 +941,13 @@ impl LearningView {
                                             .size_4()
                                             .text_color(colors.primary),
                                     )
-                                    .child(unit.objective.clone())
+                                    .child(
+                                        TextView::markdown(
+                                            format!("learning-recap-objective-{}", unit.local_id),
+                                            unit.objective.clone(),
+                                        )
+                                        .selectable(true),
+                                    )
                             })
                     }))
                     .child(if reviewing {
@@ -1037,7 +1047,14 @@ impl LearningView {
                                         prompt.format.label()
                                     )),
                             )
-                            .child(div().font_medium().child(prompt.question.clone()))
+                            .child(
+                                TextView::markdown(
+                                    ("learning-review-question", index),
+                                    prompt.question.clone(),
+                                )
+                                .selectable(true)
+                                .font_medium(),
+                            )
                             .child(
                                 div()
                                     .p_3()
@@ -1053,7 +1070,13 @@ impl LearningView {
                                                     .text_color(colors.success)
                                                     .child("参考答案"),
                                             )
-                                            .child(markdown(prompt.standard_answer.clone())),
+                                            .child(
+                                                TextView::markdown(
+                                                    ("learning-review-answer", index),
+                                                    prompt.standard_answer.clone(),
+                                                )
+                                                .selectable(true),
+                                            ),
                                     ),
                             )
                     }))
@@ -1089,10 +1112,10 @@ impl LearningView {
                     )),
             )
             .child(
-                div()
-                    .text_base()
-                    .font_medium()
-                    .child(prompt.question.clone()),
+                div().text_base().font_medium().child(
+                    TextView::markdown("learning-current-question", prompt.question.clone())
+                        .selectable(true),
+                ),
             );
         if self.remediation {
             let evidence = self
@@ -1117,7 +1140,10 @@ impl LearningView {
                     .border_l_2()
                     .border_color(colors.warning)
                     .bg(colors.warning.opacity(0.08))
-                    .child(markdown(evidence).selectable(true)),
+                    .child(
+                        TextView::markdown("learning-remediation-evidence", evidence)
+                            .selectable(true),
+                    ),
             );
         }
         if prompt_format == QuestionFormat::Choice {
@@ -1169,7 +1195,10 @@ impl LearningView {
                     } else {
                         colors.warning.opacity(0.1)
                     })
-                    .child(markdown(feedback)),
+                    .child(
+                        TextView::markdown("learning-checkpoint-feedback", feedback)
+                            .selectable(true),
+                    ),
             );
         }
         view.child(
