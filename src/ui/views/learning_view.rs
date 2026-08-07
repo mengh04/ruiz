@@ -1369,8 +1369,7 @@ impl LearningView {
                                             }),
                                         ),
                                 ),
-                        )
-                        .vertical_scrollbar(&self.outline_scroll),
+                        ),
                 )
                 .into_any_element();
         }
