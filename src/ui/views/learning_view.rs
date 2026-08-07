@@ -720,9 +720,8 @@ impl LearningView {
 }
 
 impl Render for LearningView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let compact = window.viewport_size().width.as_f32() < 900.;
         let total = self.plan.as_ref().map(|plan| plan.steps.len()).unwrap_or(0);
         let completed = self.unlocked_step.min(total);
         let progress = if total == 0 {
@@ -777,7 +776,7 @@ impl Render for LearningView {
             .child(
                 Button::new("pause-learning")
                     .icon(IconName::Pause)
-                    .when(!compact, |button| button.label("暂停"))
+                    .label("暂停")
                     .outline()
                     .on_click(cx.listener(|this, _, _, cx| this.pause(cx))),
             );
@@ -835,60 +834,31 @@ impl Render for LearningView {
             self.render_step(cx).into_any_element()
         };
 
-        let body = if compact {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .child(
-                    div()
-                        .h(if self.outline_collapsed {
-                            px(52.)
-                        } else {
-                            px(150.)
-                        })
-                        .flex_shrink_0()
-                        .border_b_1()
-                        .border_color(colors.border)
-                        .child(self.render_outline(true, cx)),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .w_full()
-                        .child(main_content),
-                )
-                .into_any_element()
-        } else {
-            h_flex()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .h_full()
-                        .child(main_content),
-                )
-                .child(
-                    div()
-                        .w(if self.outline_collapsed {
-                            px(52.)
-                        } else {
-                            px(340.)
-                        })
-                        .h_full()
-                        .flex_shrink_0()
-                        .border_l_1()
-                        .border_color(colors.border)
-                        .child(self.render_outline(false, cx)),
-                )
-                .into_any_element()
-        };
+        let body = h_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .h_full()
+                    .child(main_content),
+            )
+            .child(
+                div()
+                    .w(if self.outline_collapsed {
+                        px(52.)
+                    } else {
+                        px(340.)
+                    })
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_1()
+                    .border_color(colors.border)
+                    .child(self.render_outline(cx)),
+            );
         v_flex()
             .size_full()
             .bg(colors.background)
@@ -1342,7 +1312,7 @@ impl LearningView {
             .into_any_element()
     }
 
-    fn render_outline(&self, compact: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_outline(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let steps = self
             .plan
             .as_ref()
@@ -1364,77 +1334,82 @@ impl LearningView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_outline(cx)));
 
         if self.outline_collapsed {
-            if compact {
-                return div()
-                    .id("learning-outline-collapsed-horizontal-scroll")
-                    .size_full()
-                    .overflow_x_scroll()
-                    .child(
-                        h_flex()
-                            .h_full()
-                            .flex_none()
-                            .px_2()
-                            .items_center()
-                            .gap_1()
-                            .child(toggle)
-                            .children(
-                                steps
-                                    .iter()
-                                    .map(|step| self.render_outline_item(step, true, cx)),
-                            ),
-                    )
-                    .into_any_element();
-            }
-            return div()
-                .id("learning-outline-collapsed-vertical-scroll")
+            return v_flex()
                 .size_full()
-                .overflow_y_scroll()
                 .child(
-                    v_flex()
+                    div()
+                        .flex_shrink_0()
                         .w_full()
                         .p_2()
-                        .items_center()
-                        .gap_2()
-                        .child(toggle)
-                        .children(
-                            steps
-                                .iter()
-                                .map(|step| self.render_outline_item(step, true, cx)),
-                        ),
+                        .child(h_flex().w_full().justify_center().child(toggle)),
+                )
+                .child(
+                    div()
+                        .id("learning-outline-collapsed-scroll-wrap")
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .child(
+                            div()
+                                .id("learning-outline-collapsed-scroll")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.outline_scroll)
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .px_2()
+                                        .pb_2()
+                                        .items_center()
+                                        .gap_2()
+                                        .children(
+                                            steps.iter().map(|step| {
+                                                self.render_outline_item(step, true, cx)
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .vertical_scrollbar(&self.outline_scroll),
                 )
                 .into_any_element();
         }
 
-        div()
-            .id("learning-outline-scroll-wrap")
-            .relative()
+        v_flex()
             .size_full()
             .child(
-                div()
-                    .id("learning-outline-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.outline_scroll)
-                    .child(
-                        v_flex()
-                            .p_4()
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(div().text_sm().font_semibold().child("章节进度"))
-                                    .child(toggle),
-                            )
-                            .children(
-                                steps
-                                    .iter()
-                                    .map(|step| self.render_outline_item(step, false, cx)),
-                            ),
-                    ),
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .justify_between()
+                    .gap_2()
+                    .p_4()
+                    .child(div().text_sm().font_semibold().child("章节进度"))
+                    .child(toggle),
             )
-            .vertical_scrollbar(&self.outline_scroll)
+            .child(
+                div()
+                    .id("learning-outline-scroll-wrap")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("learning-outline-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.outline_scroll)
+                            .child(
+                                v_flex().px_4().pb_4().gap_3().children(
+                                    steps
+                                        .iter()
+                                        .map(|step| self.render_outline_item(step, false, cx)),
+                                ),
+                            ),
+                    )
+                    .vertical_scrollbar(&self.outline_scroll),
+            )
             .into_any_element()
     }
 }
