@@ -53,6 +53,7 @@ pub struct ReviewConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub sidebar_collapsed: bool,
+    pub learning_outline_collapsed: bool,
 }
 
 pub fn load_config() -> Config {
@@ -134,6 +135,7 @@ mod tests {
         assert_eq!(config.ai.model, DEEPSEEK_FLASH_MODEL);
         assert!(!config.review.adaptive_answer_formats);
         assert!(!config.ui.sidebar_collapsed);
+        assert!(!config.ui.learning_outline_collapsed);
         assert!(serde_json::to_value(config).unwrap()["ai"]["api_base"].is_null());
     }
 }

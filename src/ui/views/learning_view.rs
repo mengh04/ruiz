@@ -29,6 +29,7 @@ use crate::{
         },
         note::Note,
     },
+    settings::{AppSettings, save_config},
     state::AppState,
     ui::notifications,
 };
@@ -58,6 +59,7 @@ pub struct LearningView {
     prefetching_prompt_step_id: Option<i64>,
     busy: bool,
     load_error: Option<String>,
+    outline_collapsed: bool,
     window: AnyWindowHandle,
     content_scroll: ScrollHandle,
     outline_scroll: ScrollHandle,
@@ -71,6 +73,10 @@ impl LearningView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let outline_collapsed = AppSettings::global(cx)
+            .settings
+            .ui
+            .learning_outline_collapsed;
         let answer = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("写下你的回答…")
@@ -102,6 +108,7 @@ impl LearningView {
             prefetching_prompt_step_id: None,
             busy: false,
             load_error: None,
+            outline_collapsed,
             window: window.window_handle(),
             content_scroll: ScrollHandle::new(),
             outline_scroll: ScrollHandle::new(),
@@ -220,6 +227,23 @@ impl LearningView {
     fn return_to_progress(&mut self, cx: &mut Context<Self>) {
         self.current_step = self.unlocked_step;
         self.prepare_current(cx);
+        cx.notify();
+    }
+
+    fn toggle_outline(&mut self, cx: &mut Context<Self>) {
+        self.outline_collapsed = !self.outline_collapsed;
+        let config = {
+            let settings = AppSettings::global_mut(cx);
+            settings.settings.ui.learning_outline_collapsed = self.outline_collapsed;
+            settings.settings.clone()
+        };
+        if let Err(error) = save_config(&config) {
+            crate::diagnostics::error(
+                "learning.outline.save_failed",
+                "Failed to persist learning outline state",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        }
         cx.notify();
     }
 
@@ -810,11 +834,15 @@ impl Render for LearningView {
                 .w_full()
                 .child(
                     div()
-                        .h(px(150.))
+                        .h(if self.outline_collapsed {
+                            px(52.)
+                        } else {
+                            px(150.)
+                        })
                         .flex_shrink_0()
                         .border_b_1()
                         .border_color(colors.border)
-                        .child(self.render_outline(cx)),
+                        .child(self.render_outline(true, cx)),
                 )
                 .child(
                     v_flex()
@@ -840,12 +868,16 @@ impl Render for LearningView {
                 )
                 .child(
                     div()
-                        .w(px(340.))
+                        .w(if self.outline_collapsed {
+                            px(52.)
+                        } else {
+                            px(340.)
+                        })
                         .h_full()
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(colors.border)
-                        .child(self.render_outline(cx)),
+                        .child(self.render_outline(false, cx)),
                 )
                 .into_any_element()
         };
@@ -1216,13 +1248,155 @@ impl LearningView {
             .into_any_element()
     }
 
-    fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_outline_item(
+        &self,
+        step: &LearningStep,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let colors = cx.theme().colors;
+        let step_index = step.position;
+        let selected = step_index == self.current_step;
+        let completed = step_index < self.unlocked_step;
+        let clickable = step_index != self.current_step
+            && step_index <= self.unlocked_step
+            && !self.busy
+            && !self.loading_prompt;
+        let locked = step_index > self.unlocked_step;
+        let label = format!(
+            "{} · {}",
+            step.topic_title,
+            match step.kind {
+                LearningStepKind::Read => "阅读",
+                LearningStepKind::Checkpoint => "检查",
+                LearningStepKind::Recap => "回顾",
+            }
+        );
+        let icon = match step.kind {
+            LearningStepKind::Read => Icon::new(IconName::BookOpen),
+            LearningStepKind::Checkpoint => Icon::new(RuizIcon::Pencil),
+            LearningStepKind::Recap => Icon::new(RuizIcon::BrainCircuit),
+        }
+        .size_4()
+        .text_color(if completed {
+            colors.success
+        } else if selected {
+            colors.primary
+        } else {
+            colors.muted_foreground
+        });
+
+        if collapsed {
+            return Button::new(SharedString::from(format!(
+                "learning-outline-step-{step_index}"
+            )))
+            .small()
+            .ghost()
+            .selected(selected)
+            .icon(icon)
+            .tooltip(label)
+            .disabled(locked || self.busy || self.loading_prompt)
+            .when(clickable, |button| {
+                button.on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_step(step_index, cx);
+                }))
+            })
+            .into_any_element();
+        }
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "learning-outline-step-{step_index}"
+            )))
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .when(selected, |item| item.bg(colors.accent))
+            .text_color(if selected {
+                colors.primary
+            } else {
+                colors.muted_foreground
+            })
+            .when(clickable, |item| {
+                item.cursor_pointer()
+                    .hover(move |style| style.bg(colors.accent.opacity(0.65)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_step(step_index, cx);
+                    }))
+            })
+            .child(icon)
+            .child(div().min_w_0().flex_1().truncate().child(label))
+            .into_any_element()
+    }
+
+    fn render_outline(&self, compact: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let steps = self
             .plan
             .as_ref()
             .map(|plan| plan.steps.as_slice())
             .unwrap_or_default();
+        let toggle = Button::new("toggle-learning-outline")
+            .small()
+            .ghost()
+            .icon(if self.outline_collapsed {
+                IconName::PanelRightOpen
+            } else {
+                IconName::PanelRightClose
+            })
+            .tooltip(if self.outline_collapsed {
+                "展开章节进度"
+            } else {
+                "折叠章节进度"
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_outline(cx)));
+
+        if self.outline_collapsed {
+            if compact {
+                return div()
+                    .id("learning-outline-collapsed-horizontal-scroll")
+                    .size_full()
+                    .overflow_x_scroll()
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .flex_none()
+                            .px_2()
+                            .items_center()
+                            .gap_1()
+                            .child(toggle)
+                            .children(
+                                steps
+                                    .iter()
+                                    .map(|step| self.render_outline_item(step, true, cx)),
+                            ),
+                    )
+                    .into_any_element();
+            }
+            return div()
+                .id("learning-outline-collapsed-vertical-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .p_2()
+                        .items_center()
+                        .gap_2()
+                        .child(toggle)
+                        .children(
+                            steps
+                                .iter()
+                                .map(|step| self.render_outline_item(step, true, cx)),
+                        ),
+                )
+                .into_any_element();
+        }
+
         div()
             .id("learning-outline-scroll-wrap")
             .relative()
@@ -1237,63 +1411,23 @@ impl LearningView {
                         v_flex()
                             .p_4()
                             .gap_3()
-                            .child(div().text_sm().font_semibold().child("章节进度"))
-                            .children(steps.iter().map(|step| {
-                                let step_index = step.position;
-                                let selected = step_index == self.current_step;
-                                let completed = step_index < self.unlocked_step;
-                                let accessible = step_index != self.current_step
-                                    && step_index <= self.unlocked_step
-                                    && !self.busy
-                                    && !self.loading_prompt;
+                            .child(
                                 h_flex()
-                                    .id(SharedString::from(format!(
-                                        "learning-outline-step-{step_index}"
-                                    )))
                                     .w_full()
-                                    .min_w_0()
-                                    .px_2()
-                                    .py_2()
-                                    .rounded_md()
-                                    .items_center()
+                                    .justify_between()
                                     .gap_2()
-                                    .text_sm()
-                                    .when(selected, |item| item.bg(colors.accent))
-                                    .text_color(if selected {
-                                        colors.primary
-                                    } else {
-                                        colors.muted_foreground
-                                    })
-                                    .when(accessible, |item| {
-                                        item.cursor_pointer()
-                                            .hover(move |style| {
-                                                style.bg(colors.accent.opacity(0.65))
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.select_step(step_index, cx);
-                                            }))
-                                    })
-                                    .child(
-                                        Icon::new(if completed {
-                                            IconName::CircleCheck
-                                        } else {
-                                            IconName::Minus
-                                        })
-                                        .size_4(),
-                                    )
-                                    .child(div().min_w_0().flex_1().truncate().child(format!(
-                                        "{} · {}",
-                                        step.topic_title,
-                                        match step.kind {
-                                            LearningStepKind::Read => "阅读",
-                                            LearningStepKind::Checkpoint => "检查",
-                                            LearningStepKind::Recap => "回顾",
-                                        }
-                                    )))
-                            })),
+                                    .child(div().text_sm().font_semibold().child("章节进度"))
+                                    .child(toggle),
+                            )
+                            .children(
+                                steps
+                                    .iter()
+                                    .map(|step| self.render_outline_item(step, false, cx)),
+                            ),
                     ),
             )
             .vertical_scrollbar(&self.outline_scroll)
+            .into_any_element()
     }
 }
 
