@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use gpui::{
     AnyWindowHandle, Context, Entity, IntoElement, MouseButton, NavigationDirection, Render,
-    ScrollHandle, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point,
-    prelude::*, px, relative, size,
+    ScrollHandle, SharedString, Window, div, point, prelude::*, px, relative,
 };
 use gpui_component::Disableable as _;
 use gpui_component::breadcrumb::{Breadcrumb, BreadcrumbItem};
@@ -26,8 +25,8 @@ use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::theme::ActiveTheme as _;
 use gpui_component::{
-    Icon, IconName, IndexPath, Placement, Root, Sizable as _, StyledExt as _, TitleBar,
-    WindowExt as _, h_flex, v_flex,
+    Icon, IconName, IndexPath, Placement, Root, Sizable as _, StyledExt as _, WindowExt as _,
+    h_flex, v_flex,
 };
 
 use crate::ai::progress::{ImportCancellation, ImportEvent, ImportProgress, ImportStage};
@@ -40,7 +39,7 @@ use crate::domain::note::Note;
 use crate::state::AppState;
 use crate::ui::components::{empty_state, page_header};
 use crate::ui::notifications;
-use crate::ui::views::learning_view::LearningView;
+use crate::ui::views::learning_view::{LearningView, LearningViewEvent};
 
 pub struct NotesView {
     notes: Vec<Note>,
@@ -51,6 +50,7 @@ pub struct NotesView {
     import_group_selection_changed: bool,
     /// 笔记页内部导航状态，实体在切换主 Tab 时不会重建。
     page: NotesPage,
+    learning: Option<Entity<LearningView>>,
     content: Entity<InputState>,
     group_name_input: Entity<InputState>,
     analysis: Option<MaterialAnalysis>,
@@ -87,13 +87,14 @@ enum NotesPage {
     Library,
     Detail(i64),
     Reader(i64),
+    Learning(i64),
 }
 
 impl NotesPage {
     fn note_id(self) -> Option<i64> {
         match self {
             Self::Library => None,
-            Self::Detail(id) | Self::Reader(id) => Some(id),
+            Self::Detail(id) | Self::Reader(id) | Self::Learning(id) => Some(id),
         }
     }
 }
@@ -145,6 +146,7 @@ impl NotesView {
             selected_group_id: None,
             import_group_selection_changed: false,
             page: NotesPage::Library,
+            learning: None,
             content,
             group_name_input,
             analysis: None,
@@ -649,6 +651,7 @@ impl NotesView {
 
     fn select_note(&mut self, id: i64, cx: &mut Context<Self>) {
         self.page = NotesPage::Detail(id);
+        self.learning = None;
         self.analysis = None;
         self.units.clear();
         self.learning_session_exists = false;
@@ -666,12 +669,14 @@ impl NotesView {
 
     fn show_detail(&mut self, id: i64, cx: &mut Context<Self>) {
         self.page = NotesPage::Detail(id);
+        self.learning = None;
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
     fn show_library(&mut self, cx: &mut Context<Self>) {
         self.page = NotesPage::Library;
+        self.learning = None;
         self.detail_loading = false;
         self.analysis = None;
         self.units.clear();
@@ -680,7 +685,7 @@ impl NotesView {
         cx.notify();
     }
 
-    fn open_learning(&mut self, note_id: i64, cx: &mut Context<Self>) {
+    fn open_learning(&mut self, note_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(note) = self.notes.iter().find(|note| note.id == note_id).cloned() else {
             return;
         };
@@ -695,38 +700,14 @@ impl NotesView {
         let units = self.units.clone();
         self.learning_session_exists = true;
         self.can_resume_learning = true;
-        cx.notify();
-        let bounds = WindowBounds::centered(size(px(1180.), px(780.)), cx);
-        cx.spawn(async move |_, cx| {
-            let result = cx.open_window(
-                WindowOptions {
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(format!("引导学习 · {}", note.title).into()),
-                        ..TitleBar::title_bar_options()
-                    }),
-                    window_bounds: Some(bounds),
-                    window_min_size: Some(size(px(680.), px(560.))),
-                    #[cfg(target_os = "linux")]
-                    window_background: gpui::WindowBackgroundAppearance::Transparent,
-                    #[cfg(target_os = "linux")]
-                    window_decorations: Some(gpui::WindowDecorations::Client),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let learning =
-                        cx.new(|cx| LearningView::new(note, analysis, units, window, cx));
-                    cx.new(|cx| Root::new(learning, window, cx))
-                },
-            );
-            if let Err(error) = result {
-                crate::diagnostics::error(
-                    "learning.window.open_failed",
-                    "Failed to open guided learning window",
-                    serde_json::json!({ "error": error.to_string() }),
-                );
-            }
+        let learning = cx.new(|cx| LearningView::new(note, analysis, units, window, cx));
+        cx.subscribe(&learning, move |this, _, event, cx| match event {
+            LearningViewEvent::Exit => this.show_detail(note_id, cx),
         })
         .detach();
+        self.learning = Some(learning);
+        self.page = NotesPage::Learning(note_id);
+        cx.notify();
     }
 
     fn confirm_reset_learning(
@@ -808,6 +789,7 @@ impl NotesView {
             NotesPage::Library => {}
             NotesPage::Detail(_) => self.show_library(cx),
             NotesPage::Reader(id) => self.show_detail(id, cx),
+            NotesPage::Learning(id) => self.show_detail(id, cx),
         }
     }
 
@@ -1598,6 +1580,7 @@ impl Render for NotesView {
                     cx,
                 )
             }
+            NotesPage::Learning(_) => div(),
         };
 
         let library_filters = self.library_group_filters.clone();
@@ -2280,8 +2263,8 @@ impl Render for NotesView {
                                             })
                                             .primary()
                                             .disabled(self.detail_loading || self.units.is_empty())
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_learning(id, cx);
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_learning(id, window, cx);
                                             })),
                                     )
                                     .child(
@@ -2380,6 +2363,11 @@ impl Render for NotesView {
         let page = match self.page {
             NotesPage::Library => notes_list.into_any_element(),
             NotesPage::Detail(_) | NotesPage::Reader(_) => detail_scrollable.into_any_element(),
+            NotesPage::Learning(_) => self
+                .learning
+                .clone()
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| div().size_full().into_any_element()),
         };
 
         div()

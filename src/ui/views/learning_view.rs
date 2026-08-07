@@ -1,6 +1,6 @@
 use gpui::{
-    AnyWindowHandle, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Window, div,
-    point, prelude::*, px, relative,
+    AnyWindowHandle, Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle,
+    SharedString, Window, div, point, prelude::*, px, relative,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -64,6 +64,12 @@ pub struct LearningView {
     content_scroll: ScrollHandle,
     outline_scroll: ScrollHandle,
 }
+
+pub enum LearningViewEvent {
+    Exit,
+}
+
+impl EventEmitter<LearningViewEvent> for LearningView {}
 
 impl LearningView {
     pub fn new(
@@ -701,7 +707,7 @@ impl LearningView {
         cx.notify();
     }
 
-    fn pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn pause(&mut self, cx: &mut Context<Self>) {
         if let Some(session) = self.session.clone() {
             let pool = AppState::global(cx).pool.clone();
             gpui_tokio::Tokio::spawn(cx, async move {
@@ -709,7 +715,7 @@ impl LearningView {
             })
             .detach();
         }
-        window.remove_window();
+        cx.emit(LearningViewEvent::Exit);
     }
 }
 
@@ -773,7 +779,7 @@ impl Render for LearningView {
                     .icon(IconName::Pause)
                     .when(!compact, |button| button.label("暂停"))
                     .outline()
-                    .on_click(cx.listener(|this, _, window, cx| this.pause(window, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.pause(cx))),
             );
 
         let main_content = if self.loading {
@@ -818,9 +824,11 @@ impl Render for LearningView {
                 )
                 .child(
                     Button::new("close-completed")
-                        .label("返回资料库")
+                        .label("返回笔记")
                         .primary()
-                        .on_click(|_, window, _| window.remove_window()),
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(LearningViewEvent::Exit);
+                        })),
                 )
                 .into_any_element()
         } else {
