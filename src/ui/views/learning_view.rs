@@ -41,6 +41,7 @@ pub struct LearningView {
     blocks: Vec<ContentBlock>,
     session: Option<LearningSession>,
     current_step: usize,
+    unlocked_step: usize,
     prompts: Vec<LearningPrompt>,
     current_prompt_index: usize,
     retry_prompt: Option<LearningPrompt>,
@@ -84,6 +85,7 @@ impl LearningView {
             blocks: Vec::new(),
             session: None,
             current_step: 0,
+            unlocked_step: 0,
             prompts: Vec::new(),
             current_prompt_index: 0,
             retry_prompt: None,
@@ -169,8 +171,9 @@ impl LearningView {
                     this.update(&mut cx, |this, cx| {
                         match result {
                             Ok((plan, blocks, session)) => {
-                                this.current_step =
+                                this.unlocked_step =
                                     session.current_step_index.min(plan.steps.len());
+                                this.current_step = this.unlocked_step;
                                 this.plan = Some(plan);
                                 this.blocks = blocks;
                                 this.session = Some(session);
@@ -195,6 +198,31 @@ impl LearningView {
         self.plan.as_ref()?.steps.get(self.current_step)
     }
 
+    fn is_reviewing(&self) -> bool {
+        self.current_step != self.unlocked_step
+    }
+
+    fn select_step(&mut self, step_index: usize, cx: &mut Context<Self>) {
+        let total = self.plan.as_ref().map_or(0, |plan| plan.steps.len());
+        if self.busy
+            || self.loading_prompt
+            || step_index == self.current_step
+            || step_index >= total
+            || step_index > self.unlocked_step
+        {
+            return;
+        }
+        self.current_step = step_index;
+        self.prepare_current(cx);
+        cx.notify();
+    }
+
+    fn return_to_progress(&mut self, cx: &mut Context<Self>) {
+        self.current_step = self.unlocked_step;
+        self.prepare_current(cx);
+        cx.notify();
+    }
+
     fn prepare_current(&mut self, cx: &mut Context<Self>) {
         self.content_scroll.set_offset(point(px(0.), px(0.)));
         self.prompts.clear();
@@ -211,6 +239,12 @@ impl LearningView {
         let Some(step) = self.current().cloned() else {
             return;
         };
+        if self.is_reviewing() {
+            if step.kind == LearningStepKind::Checkpoint {
+                self.prepare_prompt(step, true, false, cx);
+            }
+            return;
+        }
         if step.kind == LearningStepKind::Recap {
             self.prepare_recap(step, cx);
             return;
@@ -230,7 +264,7 @@ impl LearningView {
             self.loading_prompt = true;
             return;
         }
-        self.prepare_prompt(step, true, cx);
+        self.prepare_prompt(step, true, true, cx);
     }
 
     fn prefetch_next_checkpoint(&mut self, cx: &mut Context<Self>) {
@@ -250,10 +284,16 @@ impl LearningView {
         if self.prefetching_prompt_step_id == Some(step_id) {
             return;
         }
-        self.prepare_prompt(step, false, cx);
+        self.prepare_prompt(step, false, true, cx);
     }
 
-    fn prepare_prompt(&mut self, step: LearningStep, foreground: bool, cx: &mut Context<Self>) {
+    fn prepare_prompt(
+        &mut self,
+        step: LearningStep,
+        foreground: bool,
+        generate_missing: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(step_id) = step.id else {
             if foreground {
                 self.notify(Notification::error("理解检查尚未保存"), cx);
@@ -278,47 +318,49 @@ impl LearningView {
                         let mut prompts = db::learning::prompts_for_step(&pool, step_id).await?;
                         prompts.sort_by_key(|prompt| prompt.position);
                         prompts.dedup_by_key(|prompt| prompt.position);
-                        for (position, target_unit_ids) in targets.iter().enumerate() {
-                            if prompts.iter().any(|prompt| prompt.position == position) {
-                                continue;
-                            }
-                            let recent_questions = prompts
-                                .iter()
-                                .map(|prompt| prompt.question.clone())
-                                .collect::<Vec<_>>();
-                            let generated = if let Some(client) = client.as_ref() {
-                                ai::learning_question::generate(
-                                    client,
-                                    &step,
-                                    &units,
-                                    &blocks,
-                                    ai::learning_question::QuestionContext {
-                                        target_unit_ids,
-                                        position,
-                                        total_questions,
-                                        recent_questions: &recent_questions,
-                                    },
-                                )
-                                .await
-                                .ok()
-                            } else {
-                                None
-                            };
-                            let prompt = match generated {
-                                Some(prompt) => prompt,
-                                None => {
-                                    db::learning::fallback_prompt(
-                                        &pool,
+                        if generate_missing {
+                            for (position, target_unit_ids) in targets.iter().enumerate() {
+                                if prompts.iter().any(|prompt| prompt.position == position) {
+                                    continue;
+                                }
+                                let recent_questions = prompts
+                                    .iter()
+                                    .map(|prompt| prompt.question.clone())
+                                    .collect::<Vec<_>>();
+                                let generated = if let Some(client) = client.as_ref() {
+                                    ai::learning_question::generate(
+                                        client,
                                         &step,
                                         &units,
-                                        target_unit_ids,
-                                        position,
+                                        &blocks,
+                                        ai::learning_question::QuestionContext {
+                                            target_unit_ids,
+                                            position,
+                                            total_questions,
+                                            recent_questions: &recent_questions,
+                                        },
                                     )
-                                    .await?
-                                }
-                            };
-                            prompts.push(db::learning::insert_prompt(&pool, &prompt).await?);
-                            prompts.sort_by_key(|prompt| prompt.position);
+                                    .await
+                                    .ok()
+                                } else {
+                                    None
+                                };
+                                let prompt = match generated {
+                                    Some(prompt) => prompt,
+                                    None => {
+                                        db::learning::fallback_prompt(
+                                            &pool,
+                                            &step,
+                                            &units,
+                                            target_unit_ids,
+                                            position,
+                                        )
+                                        .await?
+                                    }
+                                };
+                                prompts.push(db::learning::insert_prompt(&pool, &prompt).await?);
+                                prompts.sort_by_key(|prompt| prompt.position);
+                            }
                         }
                         prompts.retain(|prompt| prompt.position < total_questions);
                         anyhow::Ok(prompts)
@@ -395,6 +437,7 @@ impl LearningView {
                                 this.recap_unit_ids = candidates;
                                 if let Some(next) = next {
                                     this.current_step = next;
+                                    this.unlocked_step = next;
                                     if let Some(session) = this.session.as_mut() {
                                         session.current_step_index = next;
                                     }
@@ -418,6 +461,9 @@ impl LearningView {
     }
 
     fn complete_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_reviewing() {
+            return;
+        }
         let (Some(session), Some(step)) = (self.session.clone(), self.current().cloned()) else {
             return;
         };
@@ -447,6 +493,7 @@ impl LearningView {
                         match completed {
                             Ok(next) => {
                                 this.current_step = next;
+                                this.unlocked_step = next;
                                 if let Some(session) = this.session.as_mut() {
                                     session.current_step_index = next;
                                 }
@@ -467,6 +514,9 @@ impl LearningView {
     }
 
     fn submit_answer(&mut self, cx: &mut Context<Self>) {
+        if self.is_reviewing() {
+            return;
+        }
         let Some(step) = self.current().cloned() else {
             return;
         };
@@ -598,6 +648,9 @@ impl LearningView {
     }
 
     fn dont_know(&mut self, cx: &mut Context<Self>) {
+        if self.is_reviewing() {
+            return;
+        }
         merge_result(&mut self.first_result, "incorrect");
         self.feedback = Some("先回看下方原文证据，再用自己的话重新回答原题。".into());
         self.begin_remediation();
@@ -605,6 +658,9 @@ impl LearningView {
     }
 
     fn continue_checkpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_reviewing() {
+            return;
+        }
         if self.current_prompt_index + 1 >= self.prompts.len() {
             self.complete_current(window, cx);
             return;
@@ -638,7 +694,7 @@ impl Render for LearningView {
         let colors = cx.theme().colors;
         let compact = window.viewport_size().width.as_f32() < 900.;
         let total = self.plan.as_ref().map(|plan| plan.steps.len()).unwrap_or(0);
-        let completed = self.current_step.min(total);
+        let completed = self.unlocked_step.min(total);
         let progress = if total == 0 {
             0.0
         } else {
@@ -718,7 +774,7 @@ impl Render for LearningView {
                 )
                 .child(div().max_w(px(620.)).text_sm().child(error))
                 .into_any_element()
-        } else if completed >= total {
+        } else if completed >= total && !self.is_reviewing() {
             v_flex()
                 .flex_1()
                 .items_center()
@@ -805,6 +861,7 @@ impl LearningView {
     fn render_step(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let step = self.current().cloned().expect("current step");
+        let reviewing = self.is_reviewing();
         let content = match step.kind {
             LearningStepKind::Read => {
                 let blocks = step
@@ -820,57 +877,76 @@ impl LearningView {
                             .text_color(colors.foreground)
                             .child(markdown(block.source_text).selectable(true))
                     }))
-                    .child(
-                        h_flex().justify_end().pt_3().child(
-                            Button::new("complete-read")
-                                .icon(IconName::ArrowRight)
-                                .label("继续")
-                                .primary()
-                                .loading(self.busy)
-                                .disabled(self.busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.complete_current(window, cx);
-                                })),
-                        ),
-                    )
+                    .child(if reviewing {
+                        self.review_return_button(cx)
+                    } else {
+                        h_flex()
+                            .justify_end()
+                            .pt_3()
+                            .child(
+                                Button::new("complete-read")
+                                    .icon(IconName::ArrowRight)
+                                    .label("继续")
+                                    .primary()
+                                    .loading(self.busy)
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.complete_current(window, cx);
+                                    })),
+                            )
+                            .into_any_element()
+                    })
                     .into_any_element()
             }
             LearningStepKind::Checkpoint => self.render_checkpoint(cx).into_any_element(),
-            LearningStepKind::Recap => v_flex()
-                .gap_4()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(colors.muted_foreground)
-                        .child("回想这个主题中刚刚遇到的疑问和易错点，再继续下一部分。"),
-                )
-                .children(self.recap_unit_ids.iter().filter_map(|id| {
-                    self.units
-                        .iter()
-                        .find(|unit| &unit.local_id == id)
-                        .map(|unit| {
-                            h_flex()
-                                .items_start()
-                                .gap_2()
-                                .child(
-                                    Icon::new(IconName::CircleCheck)
-                                        .size_4()
-                                        .text_color(colors.primary),
-                                )
-                                .child(unit.objective.clone())
-                        })
-                }))
-                .child(
-                    h_flex().justify_end().child(
-                        Button::new("complete-recap")
-                            .label("完成回顾")
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.complete_current(window, cx);
-                            })),
-                    ),
-                )
-                .into_any_element(),
+            LearningStepKind::Recap => {
+                let recap_unit_ids = if reviewing {
+                    step.unit_ids.clone()
+                } else {
+                    self.recap_unit_ids.clone()
+                };
+                v_flex()
+                    .gap_4()
+                    .child(div().text_sm().text_color(colors.muted_foreground).child(
+                        if reviewing {
+                            "本次主题回顾涉及以下学习目标。"
+                        } else {
+                            "回想这个主题中刚刚遇到的疑问和易错点，再继续下一部分。"
+                        },
+                    ))
+                    .children(recap_unit_ids.iter().filter_map(|id| {
+                        self.units
+                            .iter()
+                            .find(|unit| &unit.local_id == id)
+                            .map(|unit| {
+                                h_flex()
+                                    .items_start()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(IconName::CircleCheck)
+                                            .size_4()
+                                            .text_color(colors.primary),
+                                    )
+                                    .child(unit.objective.clone())
+                            })
+                    }))
+                    .child(if reviewing {
+                        self.review_return_button(cx)
+                    } else {
+                        h_flex()
+                            .justify_end()
+                            .child(
+                                Button::new("complete-recap")
+                                    .label("完成回顾")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.complete_current(window, cx);
+                                    })),
+                            )
+                            .into_any_element()
+                    })
+                    .into_any_element()
+            }
         };
         div()
             .id("learning-content-scroll-wrap")
@@ -899,17 +975,15 @@ impl LearningView {
                                     .text_color(colors.primary)
                                     .child(step.topic_title),
                             )
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_semibold()
-                                    .mb_4()
-                                    .child(match step.kind {
-                                        LearningStepKind::Read => "阅读原文",
-                                        LearningStepKind::Checkpoint => "检查理解",
-                                        LearningStepKind::Recap => "主题回顾",
-                                    }),
-                            )
+                            .child(div().text_xl().font_semibold().mb_4().child(format!(
+                                "{}{}",
+                                match step.kind {
+                                    LearningStepKind::Read => "阅读原文",
+                                    LearningStepKind::Checkpoint => "检查理解",
+                                    LearningStepKind::Recap => "主题回顾",
+                                },
+                                if reviewing { " · 回看" } else { "" }
+                            )))
                             .child(content),
                     ),
             )
@@ -924,6 +998,61 @@ impl LearningView {
                 .gap_2()
                 .child(Spinner::new().small())
                 .child("正在准备问题…")
+                .into_any_element();
+        }
+        if self.is_reviewing() {
+            let questions = if self.prompts.is_empty() {
+                v_flex()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(colors.muted_foreground)
+                            .child("这次理解检查没有可回看的题目。"),
+                    )
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .gap_5()
+                    .children(self.prompts.iter().enumerate().map(|(index, prompt)| {
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(colors.muted_foreground)
+                                    .child(format!(
+                                        "第 {} 题 · {}",
+                                        index + 1,
+                                        prompt.format.label()
+                                    )),
+                            )
+                            .child(div().font_medium().child(prompt.question.clone()))
+                            .child(
+                                div()
+                                    .p_3()
+                                    .rounded_md()
+                                    .bg(colors.success.opacity(0.08))
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(colors.success)
+                                                    .child("参考答案"),
+                                            )
+                                            .child(markdown(prompt.standard_answer.clone())),
+                                    ),
+                            )
+                    }))
+                    .into_any_element()
+            };
+            return v_flex()
+                .gap_5()
+                .child(questions)
+                .child(self.review_return_button(cx))
                 .into_any_element();
         }
         let Some(prompt) = self
@@ -1068,6 +1197,25 @@ impl LearningView {
         .into_any_element()
     }
 
+    fn review_return_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let total = self.plan.as_ref().map_or(0, |plan| plan.steps.len());
+        h_flex()
+            .justify_end()
+            .pt_3()
+            .child(
+                Button::new("return-to-learning-progress")
+                    .icon(IconName::ArrowRight)
+                    .label(if self.unlocked_step >= total {
+                        "返回完成页"
+                    } else {
+                        "返回当前进度"
+                    })
+                    .primary()
+                    .on_click(cx.listener(|this, _, _, cx| this.return_to_progress(cx))),
+            )
+            .into_any_element()
+    }
+
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let steps = self
@@ -1091,31 +1239,49 @@ impl LearningView {
                             .gap_3()
                             .child(div().text_sm().font_semibold().child("章节进度"))
                             .children(steps.iter().map(|step| {
-                                let state = if step.position < self.current_step {
-                                    "done"
-                                } else if step.position == self.current_step {
-                                    "current"
-                                } else {
-                                    "locked"
-                                };
+                                let step_index = step.position;
+                                let selected = step_index == self.current_step;
+                                let completed = step_index < self.unlocked_step;
+                                let accessible = step_index != self.current_step
+                                    && step_index <= self.unlocked_step
+                                    && !self.busy
+                                    && !self.loading_prompt;
                                 h_flex()
+                                    .id(SharedString::from(format!(
+                                        "learning-outline-step-{step_index}"
+                                    )))
+                                    .w_full()
+                                    .min_w_0()
+                                    .px_2()
+                                    .py_2()
+                                    .rounded_md()
                                     .items_center()
                                     .gap_2()
                                     .text_sm()
-                                    .text_color(if state == "current" {
-                                        colors.foreground
+                                    .when(selected, |item| item.bg(colors.accent))
+                                    .text_color(if selected {
+                                        colors.primary
                                     } else {
                                         colors.muted_foreground
                                     })
+                                    .when(accessible, |item| {
+                                        item.cursor_pointer()
+                                            .hover(move |style| {
+                                                style.bg(colors.accent.opacity(0.65))
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_step(step_index, cx);
+                                            }))
+                                    })
                                     .child(
-                                        Icon::new(if state == "done" {
+                                        Icon::new(if completed {
                                             IconName::CircleCheck
                                         } else {
                                             IconName::Minus
                                         })
                                         .size_4(),
                                     )
-                                    .child(format!(
+                                    .child(div().min_w_0().flex_1().truncate().child(format!(
                                         "{} · {}",
                                         step.topic_title,
                                         match step.kind {
@@ -1123,7 +1289,7 @@ impl LearningView {
                                             LearningStepKind::Checkpoint => "检查",
                                             LearningStepKind::Recap => "回顾",
                                         }
-                                    ))
+                                    )))
                             })),
                     ),
             )
