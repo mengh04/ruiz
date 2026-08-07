@@ -7,6 +7,7 @@ mod domain;
 mod scheduler;
 mod settings;
 mod state;
+mod themes;
 mod ui;
 
 fn main() {

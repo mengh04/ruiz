@@ -37,6 +37,9 @@ pub fn run() {
         gpui_tokio::init(cx);
         // 注册配置 global（设置页读写的 Config）
         AppSettings::init(cx);
+        if let Err(error) = crate::themes::init(cx) {
+            eprintln!("初始化主题失败: {error:#}");
+        }
 
         let data_dir = data_dir();
         if let Err(error) = crate::diagnostics::init(&data_dir) {

@@ -1,4 +1,4 @@
-use gpui::{Context, IntoElement, Render, div, prelude::*, px};
+use gpui::{Context, IntoElement, Render, div, prelude::*, px, rgb};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
     button::Button,
@@ -13,7 +13,7 @@ use gpui_component::{
 
 use crate::ai::client::{DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL};
 use crate::assets::RuizIcon;
-use crate::settings::{AppSettings, save_config};
+use crate::settings::{AppSettings, AppTheme, save_config};
 use crate::state::AppState;
 use crate::ui::components::app_title_bar;
 
@@ -22,6 +22,91 @@ pub struct SettingsView;
 impl SettingsView {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self
+    }
+
+    fn appearance_page() -> SettingPage {
+        SettingPage::new("外观")
+            .icon(Icon::new(IconName::Palette))
+            .description("选择适合阅读和复习的界面配色。")
+            .default_open(true)
+            .resettable(false)
+            .group(
+                SettingGroup::new()
+                    .title("主题")
+                    .description("主题会立即应用到所有 Ruiz 窗口，并在重启后保留。")
+                    .items([
+                        SettingItem::new(
+                            "界面主题",
+                            SettingField::scrollable_dropdown(
+                                AppTheme::ALL
+                                    .into_iter()
+                                    .map(|theme| (theme.id().into(), theme.label().into()))
+                                    .collect(),
+                                |cx| AppSettings::global(cx).settings.ui.theme.id().into(),
+                                |value, cx| {
+                                    let Some(theme) = AppTheme::parse(value.as_ref()) else {
+                                        return;
+                                    };
+                                    AppSettings::global_mut(cx).settings.ui.theme = theme;
+                                    save_settings(cx);
+                                    if let Err(error) = crate::themes::apply(theme, cx) {
+                                        crate::diagnostics::error(
+                                            "theme.apply_failed",
+                                            "Failed to apply selected theme",
+                                            serde_json::json!({
+                                                "theme": theme.id(),
+                                                "error": format!("{error:#}"),
+                                            }),
+                                        );
+                                    }
+                                },
+                            )
+                            .default_value(AppTheme::DefaultLight.id()),
+                        )
+                        .description("内置 Ayu、Catppuccin、Gruvbox、Tokyo Night 和 Solarized。")
+                        .keywords([
+                            "theme",
+                            "appearance",
+                            "dark",
+                            "light",
+                            "主题",
+                            "外观",
+                            "深色",
+                            "浅色",
+                        ]),
+                        SettingItem::render(|_options, _window, cx| {
+                            let selected = AppSettings::global(cx).settings.ui.theme;
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(div().text_sm().child("当前色板"))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().colors.muted_foreground)
+                                                .child(selected.label()),
+                                        ),
+                                )
+                                .child(h_flex().gap_1p5().children(
+                                    selected.swatches().into_iter().map(|color| {
+                                        div()
+                                            .size_5()
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(cx.theme().colors.border)
+                                            .bg(rgb(color))
+                                    }),
+                                ))
+                        })
+                        .keywords(["palette", "colors", "色板", "颜色"]),
+                    ]),
+            )
     }
 
     fn review_page() -> SettingPage {
@@ -274,7 +359,12 @@ impl Render for SettingsView {
                     .sidebar_width(px(216.))
                     .sidebar_size_range(px(184.)..px(300.))
                     .with_group_variant(GroupBoxVariant::Outline)
-                    .pages([Self::ai_page(), Self::review_page(), Self::about_page()]),
+                    .pages([
+                        Self::appearance_page(),
+                        Self::ai_page(),
+                        Self::review_page(),
+                        Self::about_page(),
+                    ]),
             ),
         )
     }
