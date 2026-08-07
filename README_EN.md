@@ -1,73 +1,52 @@
-[English](./README_EN.md) · [中文](./README.md)
+<p align="center">
+  <img src="./assets/brand/logo.svg" alt="Ruiz Logo" width="112" />
+</p>
 
-# Ruiz
+<h1 align="center">Ruiz</h1>
 
-An AI-powered learning & memory desktop app built on [gpui](https://github.com/zed-industries/zed): hand any learning material to the AI for smart import — it automatically organizes it into a knowledge blueprint, then schedules knowledge-unit reviews with the [FSRS](https://github.com/open-spaced-repetition/fsrs4anki/wiki) spaced-repetition algorithm to make memorization far more effective.
+<p align="center">An AI-powered desktop app for independent learning and long-term memory</p>
 
-> Work in progress (WIP) — features and UI are still iterating quickly.
+<p align="center">
+  <a href="./README.md">中文</a> · <a href="./README_EN.md">English</a>
+</p>
+
+Ruiz turns learning materials into structured knowledge and combines AI-generated questions with spaced repetition to help you understand, retain, and review information more effectively.
+
+> [!NOTE]
+> Ruiz is currently under active development. Features and interfaces may change between versions.
 
 ## Features
 
-- **AI Smart Import**: paste or import learning material, and the AI runs the full pipeline — "clean web noise → merge & name materials → extract knowledge units → organize knowledge blueprint → generate foundational review questions" — with **real-time streaming stage progress**, cancellable at any time without writing half-baked data.
-- **Knowledge Blueprint**: imported materials are parsed into knowledge units (with topics, learning objectives, importance, cognitive actions, etc.), providing a structured basis for review generation.
-- **Knowledge-Unit Driven**: review centers on AI-recommended knowledge units; static prompts remain only as an internal fallback when dynamic generation fails.
-- **Dynamic Review**: during review, the AI adaptively generates dynamic question types — **multiple choice, fill-in-the-blank, applied questions** — based on knowledge-unit mastery; you can also disable adaptivity and use free-form short-answer questions uniformly.
-- **FSRS Spaced Repetition**: every knowledge unit's review date is scheduled by the FSRS scheduler (stability / difficulty / due date) for a scientific review rhythm.
-- **Study Groups**: organize notes with study groups and move notes between groups.
-- **Local Storage**: all data is stored in a local SQLite database — review works fully offline.
+- **Smart import**: Paste or import learning materials and let AI organize the content.
+- **Knowledge blueprints**: Extract knowledge units from source material and connect them into a clear learning structure.
+- **Adaptive review**: Generate different types of questions based on your current mastery.
+- **Spaced repetition**: Schedule reviews automatically to strengthen long-term memory.
+- **Study organization**: Organize notes and learning materials with study groups.
+- **Local storage**: Keep your learning data on your device for ongoing study and review.
 
-## Tech Stack
+## Prerequisites
 
-| Component | Description |
-| --- | --- |
-| [Rust](https://www.rust-lang.org/) | 2024 edition |
-| [gpui](https://github.com/zed-industries/zed) | High-performance UI framework by the Zed team |
-| [gpui-component](https://github.com/longbridge/gpui-component) | gpui component library (buttons, dialogs, sidebar, etc.) |
-| [sqlx](https://github.com/launchbadge/sqlx) | SQLite database (async) |
-| [fsrs](https://github.com/open-spaced-repetition/fsrs-rs) | Spaced-repetition scheduling algorithm |
-| [reqwest](https://github.com/seanmonstar/reqwest) | OpenAI-compatible API SSE streaming requests |
-| [tokio](https://github.com/tokio-rs/tokio) | Async runtime |
+- Install the latest stable version of [Rust](https://www.rust-lang.org/tools/install).
+- Prepare a DeepSeek API key for AI features.
+- On Linux, install the system dependencies required to build [Zed](https://github.com/zed-industries/zed/blob/main/docs/src/development/linux.md).
 
-## Requirements
+## Build and Run
 
-- Rust toolchain (2024 edition support; latest stable recommended: `rustup update stable`)
-- First compilation takes a while due to git dependencies like `gpui` — please be patient
-- On Linux, install the system libraries gpui needs at runtime (see the [zed repository](https://github.com/zed-industries/zed) for system dependency requirements)
-
-## Build & Run
+From the project root, run:
 
 ```bash
 cargo run --release
 ```
 
+The first build may take some time while dependencies are downloaded and compiled.
+
 ## Quick Start
 
-1. Launch the app and enter your DeepSeek API Key on the **Settings** page (defaults to the `deepseek-v4-flash` model; you can also switch to `deepseek-v4-pro`).
-2. Paste or import a learning material on the **Notes** page.
-3. Click import and the AI smart-import pipeline starts: expand the task panel to watch stage progress — "clean, merge, extract, organize blueprint, prepare review content" — in real time.
-4. Once the pipeline finishes, the organized material and generated foundational review questions appear in your library.
-5. Review on the **Review** page according to the FSRS schedule — the AI generates questions dynamically based on your mastery.
-
-## Data Storage
-
-The database (SQLite) is stored in the system data directory, trying in order:
-
-1. XDG data directory (`ProjectDirs`)
-2. `$XDG_DATA_HOME`
-3. `$HOME/.local/share`
-4. System temporary directory
-
-Falls back to `./ruiz-data` in the current directory if none are available.
-
-## Roadmap
-
-- [x] AI smart-import pipeline (SSE streaming progress, stage display, cancellable)
-- [x] Study groups & note management
-- [x] Dynamic review driven by AI-recommended knowledge units
-- [x] Dynamic review: adaptive AI question generation (multiple choice / fill-in-the-blank / applied)
-- [ ] Show request IDs, model output deltas and cumulative elapsed time in the task panel
-- [ ] Unified redaction of sensitive fields in logs and streaming views
+1. Launch Ruiz and configure your DeepSeek API key in Settings.
+2. Paste or import learning material from the Notes page.
+3. Wait for processing to finish, then review the generated knowledge content in your library.
+4. Open the Review page and rate your answers as you study.
 
 ## License
 
-[Apache-2.0](./LICENSE)
+This project is licensed under the [Apache License 2.0](./LICENSE).
