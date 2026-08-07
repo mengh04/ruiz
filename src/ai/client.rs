@@ -55,15 +55,10 @@ impl ChatClient {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("构建 HTTP client 失败");
-        let model = match model.as_str() {
-            DEEPSEEK_PRO_MODEL => DEEPSEEK_PRO_MODEL,
-            _ => DEEPSEEK_FLASH_MODEL,
-        }
-        .to_string();
         Self {
             http,
             api_key,
-            model,
+            model: normalize_text_model(&model),
         }
     }
 
@@ -144,18 +139,40 @@ impl ChatClient {
                 "content_chars": content.chars().count(),
             }),
         );
-        let parsed = parse_json_content(&content).map_err(|error| {
-            diagnostics::error(
-                "ai.model.output_invalid",
-                "AI model output is not valid JSON",
-                serde_json::json!({
-                    "request_id": request_id,
-                    "operation": operation,
-                    "error": format!("{error:#}"),
-                }),
-            );
-            anyhow!("模型输出不是合法 JSON（请求 #{request_id}）：{error}")
-        })?;
+        let parsed = match parse_json_content(&content) {
+            Ok(parsed) => parsed,
+            Err(parse_error) => {
+                diagnostics::warn(
+                    "ai.model.output_repairing",
+                    "AI model output was not valid JSON; retrying with the parse error",
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "operation": operation,
+                        "error": format!("{parse_error:#}"),
+                    }),
+                );
+                body["messages"][0]["content"] = serde_json::json!(format!(
+                    "{system}\n\n# JSON 修复约束\n上一次输出无法解析：{parse_error}。请只输出一个完整、合法的 JSON 对象，不要输出 Markdown、解释或思考过程。"
+                ));
+                let retry = self
+                    .send_request(request_id, operation, &url, &body)
+                    .await?;
+                let retry_response = read_response(request_id, operation, retry, None).await?;
+                let retry_content = response_content(request_id, operation, &retry_response)?;
+                parse_json_content(&retry_content).map_err(|error| {
+                    diagnostics::error(
+                        "ai.model.output_invalid",
+                        "AI model output is not valid JSON after repair retry",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "operation": operation,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                    anyhow!("模型输出不是合法 JSON（请求 #{request_id}）：{error}")
+                })?
+            }
+        };
         diagnostics::info(
             "ai.request.completed",
             "AI request completed",
@@ -249,18 +266,46 @@ impl ChatClient {
                 "content_chars": output.content.chars().count(),
             }),
         );
-        let parsed = parse_json_content(&output.content).map_err(|error| {
-            diagnostics::error(
-                "ai.model.output_invalid",
-                "Streaming AI model output is not valid JSON",
-                serde_json::json!({
-                    "request_id": request_id,
-                    "operation": operation,
-                    "error": format!("{error:#}"),
-                }),
-            );
-            anyhow!("模型输出不是合法 JSON（请求 #{request_id}）：{error}")
-        })?;
+        let parsed = match parse_json_content(&output.content) {
+            Ok(parsed) => parsed,
+            Err(parse_error) => {
+                diagnostics::warn(
+                    "ai.model.output_repairing",
+                    "Streaming AI output was not valid JSON; retrying with the parse error",
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "operation": operation,
+                        "error": format!("{parse_error:#}"),
+                    }),
+                );
+                body["messages"][0]["content"] = serde_json::json!(format!(
+                    "{system}\n\n# JSON 修复约束\n上一次输出无法解析：{parse_error}。请只输出一个完整、合法的 JSON 对象，不要输出 Markdown、解释或思考过程。"
+                ));
+                let retry = self
+                    .send_request_with_cancellation(
+                        request_id,
+                        operation,
+                        &url,
+                        &body,
+                        cancellation,
+                    )
+                    .await?;
+                output = read_stream_response(request_id, operation, retry, on_event, cancellation)
+                    .await?;
+                parse_json_content(&output.content).map_err(|error| {
+                    diagnostics::error(
+                        "ai.model.output_invalid",
+                        "Streaming AI model output is not valid JSON after repair retry",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "operation": operation,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                    anyhow!("模型输出不是合法 JSON（请求 #{request_id}）：{error}")
+                })?
+            }
+        };
         diagnostics::info(
             "ai.request.completed",
             "Streaming AI request completed",
@@ -383,6 +428,14 @@ impl ChatClient {
     }
 }
 
+fn normalize_text_model(model: &str) -> String {
+    match model.trim() {
+        DEEPSEEK_PRO_MODEL => DEEPSEEK_PRO_MODEL,
+        _ => DEEPSEEK_FLASH_MODEL,
+    }
+    .to_string()
+}
+
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -416,7 +469,9 @@ async fn wait_before_retry(
 }
 
 fn request_timeout_for(operation: &str) -> Duration {
-    if operation.starts_with("review.question.generate") {
+    if operation.starts_with("image.describe") {
+        Duration::from_secs(120)
+    } else if operation.starts_with("review.question.generate") {
         Duration::from_secs(90)
     } else if operation.starts_with("answer.judge") {
         Duration::from_secs(120)
@@ -457,12 +512,29 @@ fn reasoning_effort_for(operation: &str) -> &'static str {
 }
 
 fn max_output_tokens_for(operation: &str) -> u32 {
-    if operation.starts_with("review.question.generate") {
+    // Keep each stage's output bounded. Long-form stages may reproduce source
+    // excerpts, while interactive calls should stay small and responsive.
+    if operation.starts_with("image.describe") {
+        4_096
+    } else if operation.starts_with("answer.judge")
+        || operation.starts_with("review.question.generate")
+        || operation.starts_with("learning.question.generate")
+    {
         8_192
-    } else if operation.starts_with("import.organize") || operation.starts_with("answer.judge") {
+    } else if operation.starts_with("import.organize")
+        || operation.starts_with("questions.generate")
+        || operation.starts_with("learning.plan.generate")
+    {
         32_768
+    } else if operation.starts_with("plan.extract") {
+        65_536
+    } else if operation.starts_with("import.clean")
+        || operation.starts_with("plan.reconcile")
+        || operation.starts_with("plan.repair")
+    {
+        98_304
     } else {
-        DEEPSEEK_MAX_OUTPUT_TOKENS
+        DEEPSEEK_MAX_OUTPUT_TOKENS.min(16_384)
     }
 }
 
@@ -964,12 +1036,15 @@ mod tests {
 
     #[test]
     fn deepseek_output_budgets_match_workflow_size() {
+        assert_eq!(max_output_tokens_for("image.describe"), 4_096);
         assert_eq!(max_output_tokens_for("review.question.generate"), 8_192);
-        assert_eq!(max_output_tokens_for("answer.judge"), 32_768);
-        assert_eq!(max_output_tokens_for("plan.extract"), 384_000);
-        assert_eq!(max_output_tokens_for("plan.reconcile"), 384_000);
-        assert_eq!(max_output_tokens_for("import.clean"), 384_000);
-        assert_eq!(max_output_tokens_for("questions.generate"), 384_000);
+        assert_eq!(max_output_tokens_for("learning.question.generate"), 8_192);
+        assert_eq!(max_output_tokens_for("answer.judge"), 8_192);
+        assert_eq!(max_output_tokens_for("plan.extract"), 65_536);
+        assert_eq!(max_output_tokens_for("plan.reconcile"), 98_304);
+        assert_eq!(max_output_tokens_for("import.clean"), 98_304);
+        assert_eq!(max_output_tokens_for("import.organize"), 32_768);
+        assert_eq!(max_output_tokens_for("questions.generate"), 32_768);
     }
 
     #[test]

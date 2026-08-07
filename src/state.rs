@@ -4,12 +4,13 @@ use anyhow::Result;
 use gpui::{App, Global};
 use sqlx::SqlitePool;
 
-use crate::ai::client::ChatClient;
+use crate::ai::{client::ChatClient, image::VisionClient};
 use crate::scheduler::Scheduler;
 
 pub struct AppState {
     pub pool: SqlitePool,
     pub ai: Option<ChatClient>,
+    pub vision: Option<VisionClient>,
     pub scheduler: Scheduler,
 }
 
@@ -20,6 +21,7 @@ impl AppState {
         Ok(Self {
             pool,
             ai: None,
+            vision: None,
             scheduler: Scheduler::new(),
         })
     }
@@ -31,6 +33,23 @@ impl AppState {
             .api_key
             .as_ref()
             .map(|key| ChatClient::new(key.clone(), c.model.clone()));
+        self.vision = if c.vision.enabled() {
+            VisionClient::new(
+                c.vision.api_base.clone(),
+                c.vision.api_key.clone().unwrap_or_default(),
+                c.vision.model.clone().unwrap_or_default(),
+            )
+            .map_err(|error| {
+                crate::diagnostics::warn(
+                    "settings.vision.invalid",
+                    "Vision configuration is invalid; image recognition is disabled",
+                    serde_json::json!({ "error": format!("{error:#}") }),
+                );
+            })
+            .ok()
+        } else {
+            None
+        };
     }
 
     pub fn global(cx: &App) -> &AppState {

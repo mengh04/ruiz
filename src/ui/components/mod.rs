@@ -1,5 +1,9 @@
 //! Ruiz 跨页面复用的界面构件。
 
+mod markdown;
+
+pub use markdown::markdown_with_local_images;
+
 use gpui::{AnyElement, App, SharedString, div, prelude::*, px};
 use gpui_component::{ActiveTheme as _, Icon, StyledExt as _, TitleBar, h_flex, v_flex};
 

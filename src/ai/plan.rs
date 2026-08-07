@@ -14,6 +14,9 @@ use super::{
 const MAX_FINAL_UNITS: usize = 240;
 const MAX_PLAN_CHUNK_CHARS: usize = 60_000;
 const MAX_EVIDENCE_CHARS: usize = 2_000;
+const MAX_RECONCILE_INPUT_CHARS: usize = 450_000;
+const MAX_RECONCILE_ROUNDS: usize = 12;
+const MAX_REPAIR_CONTEXT_CHARS: usize = 400_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanClaim {
@@ -57,7 +60,7 @@ pub struct MaterialPlan {
     pub units: Vec<PlanUnit>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkPlan {
     #[serde(default)]
     topics: Vec<String>,
@@ -127,7 +130,7 @@ pub async fn analyze_material_with_progress(
         ImportStage::Reconciling,
         format!("正在去重并整理《{title}》的最终知识蓝图"),
     )));
-    let plan = reconcile_once(client, title, &candidates, progress, cancellation).await?;
+    let plan = reconcile_hierarchically(client, title, candidates, progress, cancellation).await?;
     match validate_plan_against_content(plan.clone(), content) {
         Ok(plan) => Ok(plan),
         Err(initial_error) => {
@@ -199,6 +202,77 @@ async fn reconcile_once(
     serde_json::from_value(value).map_err(|error| anyhow!("知识蓝图响应格式不对: {error}"))
 }
 
+async fn reconcile_hierarchically(
+    client: &ChatClient,
+    title: &str,
+    mut candidates: Vec<ChunkPlan>,
+    progress: &ImportEventReporter,
+    cancellation: &ImportCancellation,
+) -> Result<MaterialPlan> {
+    for round in 1..=MAX_RECONCILE_ROUNDS {
+        cancellation.ensure_active()?;
+        let batches = reconcile_batches(&candidates);
+        if batches.len() == 1 {
+            return reconcile_once(client, title, &batches[0], progress, cancellation).await;
+        }
+        progress(ImportEvent::Stage(ImportProgress::stage(
+            ImportStage::Reconciling,
+            format!(
+                "正在分层归并《{title}》知识蓝图（第 {round} 轮，{} 个批次）",
+                batches.len()
+            ),
+        )));
+        let mut next = Vec::with_capacity(batches.len());
+        for (batch_index, batch) in batches.into_iter().enumerate() {
+            cancellation.ensure_active()?;
+            let plan = reconcile_once(client, title, &batch, progress, cancellation).await?;
+            let mut candidate = ChunkPlan {
+                topics: Vec::new(),
+                warnings: plan.warnings,
+                claims: plan.claims,
+                units: plan.units,
+            };
+            prefix_ids(&mut candidate, &format!("R{round}G{}-", batch_index + 1));
+            next.push(candidate);
+        }
+        candidates = next;
+    }
+    Err(anyhow!(
+        "知识蓝图经过 {MAX_RECONCILE_ROUNDS} 轮仍无法收敛，请缩小单次导入范围"
+    ))
+}
+
+fn reconcile_batches(candidates: &[ChunkPlan]) -> Vec<Vec<ChunkPlan>> {
+    let mut batches = Vec::<Vec<ChunkPlan>>::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0usize;
+    for candidate in candidates {
+        let chars = serde_json::to_string(candidate)
+            .map(|value| value.chars().count())
+            .unwrap_or(MAX_RECONCILE_INPUT_CHARS);
+        if !current.is_empty() && current_chars.saturating_add(chars) > MAX_RECONCILE_INPUT_CHARS {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(candidate.clone());
+        current_chars = current_chars.saturating_add(chars);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    // Oversized single candidates must still make forward progress. Pairing
+    // them may exceed the preferred budget, but remains bounded by two map
+    // outputs and halves the candidate count each round.
+    if candidates.len() > 1 && batches.len() == candidates.len() {
+        return candidates
+            .chunks(2)
+            .map(|pair| pair.to_vec())
+            .collect::<Vec<_>>();
+    }
+    batches
+}
+
 async fn repair_plan(
     client: &ChatClient,
     title: &str,
@@ -211,7 +285,7 @@ async fn repair_plan(
     let input = serde_json::json!({
         "material_title": title,
         "validation_error": validation_error,
-        "material_content": material_content,
+        "material_content": bounded_content_sample(material_content, MAX_REPAIR_CONTEXT_CHARS),
         "draft_plan": plan,
     });
     let report_stream = |event| match event {
@@ -231,7 +305,10 @@ async fn repair_plan(
 }
 
 fn prefix_chunk_ids(plan: &mut ChunkPlan, source_index: usize) {
-    let prefix = format!("P{source_index}-");
+    prefix_ids(plan, &format!("P{source_index}-"));
+}
+
+fn prefix_ids(plan: &mut ChunkPlan, prefix: &str) {
     for claim in &mut plan.claims {
         claim.id = format!("{prefix}{}", claim.id.trim());
     }
@@ -244,6 +321,26 @@ fn prefix_chunk_ids(plan: &mut ChunkPlan, source_index: usize) {
             *prerequisite = format!("{prefix}{}", prerequisite.trim());
         }
     }
+}
+
+fn bounded_content_sample(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return content.to_string();
+    }
+    const WINDOWS: usize = 8;
+    let window_chars = max_chars / WINDOWS;
+    let characters = content.chars().collect::<Vec<_>>();
+    let mut samples = Vec::with_capacity(WINDOWS);
+    for index in 0..WINDOWS {
+        let center = index * total.saturating_sub(1) / (WINDOWS - 1);
+        let start = center
+            .saturating_sub(window_chars / 2)
+            .min(total - window_chars);
+        let end = (start + window_chars).min(total);
+        samples.push(characters[start..end].iter().collect::<String>());
+    }
+    samples.join("\n\n[...省略未采样正文...]\n\n")
 }
 
 fn split_plan_chunks(content: &str) -> Vec<String> {
@@ -460,8 +557,8 @@ fn validate_plan(mut plan: MaterialPlan) -> Result<MaterialPlan> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MaterialPlan, PlanClaim, PlanUnit, evidence_matches, split_plan_chunks, validate_plan,
-        validate_plan_against_content,
+        ChunkPlan, MaterialPlan, PlanClaim, PlanUnit, bounded_content_sample, evidence_matches,
+        reconcile_batches, split_plan_chunks, validate_plan, validate_plan_against_content,
     };
 
     fn valid_plan() -> MaterialPlan {
@@ -521,5 +618,38 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), 40_000);
         assert_eq!(chunks[1].chars().count(), 40_000);
+    }
+
+    #[test]
+    fn reconciliation_batches_shrink_large_candidate_sets() {
+        let template = ChunkPlan {
+            topics: vec![],
+            warnings: vec![],
+            claims: vec![],
+            units: vec![],
+        };
+        let candidates = vec![template; 9];
+        let batches = reconcile_batches(&candidates);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 9);
+
+        let oversized = ChunkPlan {
+            topics: vec!["x".repeat(super::MAX_RECONCILE_INPUT_CHARS)],
+            warnings: vec![],
+            claims: vec![],
+            units: vec![],
+        };
+        let batches = reconcile_batches(&vec![oversized; 5]);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn repair_context_is_sampled_across_long_content() {
+        let content = format!("{}MIDDLE{}", "A".repeat(50_000), "Z".repeat(50_000));
+        let sample = bounded_content_sample(&content, 8_000);
+        assert!(sample.starts_with('A'));
+        assert!(sample.ends_with('Z'));
+        assert!(sample.chars().count() < 9_000);
     }
 }

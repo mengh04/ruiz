@@ -18,6 +18,7 @@ pub struct Config {
 pub struct AiConfig {
     pub api_key: Option<String>,
     pub model: String,
+    pub vision: VisionConfig,
 }
 
 impl Default for AiConfig {
@@ -25,6 +26,7 @@ impl Default for AiConfig {
         Self {
             api_key: None,
             model: DEEPSEEK_FLASH_MODEL.into(),
+            vision: VisionConfig::default(),
         }
     }
 }
@@ -38,6 +40,53 @@ impl AiConfig {
         if self.model != DEEPSEEK_FLASH_MODEL && self.model != DEEPSEEK_PRO_MODEL {
             self.model = DEEPSEEK_FLASH_MODEL.into();
         }
+        self.vision.normalize();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionConfig {
+    pub api_base: String,
+    pub api_key: Option<String>,
+    /// Empty means image recognition is disabled.
+    pub model: Option<String>,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            api_base: "https://api.openai.com/v1".into(),
+            api_key: None,
+            model: None,
+        }
+    }
+}
+
+impl VisionConfig {
+    fn normalize(&mut self) {
+        self.api_base = self.api_base.trim().trim_end_matches('/').to_string();
+        if self.api_base.is_empty() {
+            self.api_base = Self::default().api_base;
+        }
+        self.api_key = self
+            .api_key
+            .take()
+            .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+        self.model = self.model.take().and_then(|value| {
+            let value = value.trim().chars().take(120).collect::<String>();
+            (!value.is_empty()).then_some(value)
+        });
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.api_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty())
+            && self
+                .model
+                .as_ref()
+                .is_some_and(|model| !model.trim().is_empty())
     }
 }
 
@@ -257,6 +306,7 @@ mod tests {
         config.ai.normalize();
         assert_eq!(config.ai.api_key.as_deref(), Some("secret"));
         assert_eq!(config.ai.model, DEEPSEEK_FLASH_MODEL);
+        assert!(!config.ai.vision.enabled());
         assert!(!config.review.adaptive_answer_formats);
         assert!(!config.ui.sidebar_collapsed);
         assert!(!config.ui.learning_outline_collapsed);

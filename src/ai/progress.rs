@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportStage {
     Preparing,
+    DescribingImages,
     Cleaning,
     Organizing,
     Extracting,
@@ -23,6 +24,7 @@ impl ImportStage {
     pub fn label(self) -> &'static str {
         match self {
             Self::Preparing => "准备导入",
+            Self::DescribingImages => "识别本地图片",
             Self::Cleaning => "清洗网页噪声",
             Self::Organizing => "归并并命名材料",
             Self::Extracting => "提取知识单元",
@@ -35,6 +37,7 @@ impl ImportStage {
     pub fn position(self) -> usize {
         match self {
             Self::Preparing => 0,
+            Self::DescribingImages => 1,
             Self::Cleaning => 1,
             Self::Organizing => 2,
             Self::Extracting => 3,

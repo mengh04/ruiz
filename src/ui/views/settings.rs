@@ -252,6 +252,80 @@ impl SettingsView {
                         .description("Flash 成本更低、速度更快；Pro 适合更复杂的材料分析。")
                         .keywords(["model", "模型", "deepseek", "flash", "pro"]),
                     ),
+                SettingGroup::new()
+                    .title("图像识别")
+                    .description("可选的 OpenAI 兼容视觉接口；模型留空时不会读取或上传图片。")
+                    .item(
+                        SettingItem::new(
+                            "接口地址",
+                            SettingField::input(
+                                |cx| {
+                                    AppSettings::global(cx)
+                                        .settings
+                                        .ai
+                                        .vision
+                                        .api_base
+                                        .clone()
+                                        .into()
+                                },
+                                |value, cx| {
+                                    AppSettings::global_mut(cx).settings.ai.vision.api_base =
+                                        value.trim().to_string();
+                                    refresh_ai(cx);
+                                },
+                            ),
+                        )
+                        .description("例如 https://api.openai.com/v1。")
+                        .keywords(["vision", "image", "api_base", "图片", "视觉", "接口"]),
+                    )
+                    .item(
+                        SettingItem::new(
+                            "接口密钥",
+                            SettingField::input(
+                                |cx| {
+                                    AppSettings::global(cx)
+                                        .settings
+                                        .ai
+                                        .vision
+                                        .api_key
+                                        .clone()
+                                        .unwrap_or_default()
+                                        .into()
+                                },
+                                |value, cx| {
+                                    AppSettings::global_mut(cx).settings.ai.vision.api_key =
+                                        optional_value(value.as_ref());
+                                    refresh_ai(cx);
+                                },
+                            ),
+                        )
+                        .description("仅用于图片描述请求，配置保存在本机。")
+                        .keywords(["vision", "image", "api_key", "图片", "视觉", "密钥"]),
+                    )
+                    .item(
+                        SettingItem::new(
+                            "图像识别模型",
+                            SettingField::input(
+                                |cx| {
+                                    AppSettings::global(cx)
+                                        .settings
+                                        .ai
+                                        .vision
+                                        .model
+                                        .clone()
+                                        .unwrap_or_default()
+                                        .into()
+                                },
+                                |value, cx| {
+                                    AppSettings::global_mut(cx).settings.ai.vision.model =
+                                        optional_value(value.as_ref());
+                                    refresh_ai(cx);
+                                },
+                            ),
+                        )
+                        .description("用于把图片转换成结构化中文描述；留空即禁用图片识别。")
+                        .keywords(["vision", "image", "图片", "视觉", "识别", "模型"]),
+                    ),
                 SettingGroup::new().title("说明").item(SettingItem::render(
                     |_options, _window, cx| {
                         h_flex()

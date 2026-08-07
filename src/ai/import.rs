@@ -10,7 +10,7 @@ use super::{
     text::{normalize_source, preview},
 };
 
-const MAX_MATERIALS: usize = 20;
+const MAX_MATERIALS: usize = 200;
 const MAX_CLEAN_CHUNK_CHARS: usize = 80_000;
 
 #[derive(Debug, Clone)]
@@ -192,8 +192,8 @@ pub async fn import_materials(
         }
         materials.push(ImportedMaterial {
             title: non_empty(material.title, "未命名学习材料", 120),
+            raw_content: content.clone(),
             content,
-            raw_content: source.clone(),
             summary: material.summary.trim().chars().take(500).collect(),
             document_type: non_empty(material.document_type, "mixed", 40),
         });

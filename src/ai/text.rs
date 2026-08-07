@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 
-pub const MAX_IMPORT_CHARS: usize = 300_000;
+pub const MAX_IMPORT_CHARS: usize = 120_000_000;
 
 pub fn normalize_source(raw: &str) -> Result<String> {
     let normalized = raw

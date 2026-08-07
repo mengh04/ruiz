@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 directories = { version = "6.0" }
 fsrs = "6.6.1"
@@ -36,6 +37,7 @@ tokio = { version = "1", features = [
     "macros",
     "time",
 ] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = [

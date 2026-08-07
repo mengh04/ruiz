@@ -22,7 +22,6 @@ use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
-use gpui_component::text::markdown;
 use gpui_component::theme::ActiveTheme as _;
 use gpui_component::{
     Icon, IconName, IndexPath, Placement, Root, Sizable as _, StyledExt as _, WindowExt as _,
@@ -37,7 +36,7 @@ use crate::domain::group::StudyGroup;
 use crate::domain::knowledge::{KnowledgeUnit, MaterialAnalysis};
 use crate::domain::note::Note;
 use crate::state::AppState;
-use crate::ui::components::{empty_state, page_header};
+use crate::ui::components::{empty_state, markdown_with_local_images, page_header};
 use crate::ui::notifications;
 use crate::ui::views::learning_view::{LearningView, LearningViewEvent};
 
@@ -52,6 +51,7 @@ pub struct NotesView {
     page: NotesPage,
     learning: Option<Entity<LearningView>>,
     content: Entity<InputState>,
+    source_path_input: Entity<InputState>,
     group_name_input: Entity<InputState>,
     analysis: Option<MaterialAnalysis>,
     units: Vec<KnowledgeUnit>,
@@ -128,6 +128,9 @@ impl NotesView {
         });
         let group_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("例如：计算机网络、Redis、Rust"));
+        let source_path_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("选择本地文件或目录，也可以留空仅粘贴文本")
+        });
         let tag_filter = cx.new(|cx| {
             ComboboxState::new(
                 SearchableVec::new(Vec::<GroupChoice>::new()),
@@ -148,6 +151,7 @@ impl NotesView {
             page: NotesPage::Library,
             learning: None,
             content,
+            source_path_input,
             group_name_input,
             analysis: None,
             units: Vec::new(),
@@ -402,8 +406,9 @@ impl NotesView {
     fn import_materials(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let pool = AppState::global(cx).pool.clone();
         let content = self.content.read(cx).value().to_string();
-        if content.trim().is_empty() {
-            window.push_notification(Notification::warning("请先粘贴学习材料"), cx);
+        let source_path = self.source_path_input.read(cx).value().trim().to_string();
+        if content.trim().is_empty() && source_path.is_empty() {
+            window.push_notification(Notification::warning("请选择本地来源或粘贴学习材料"), cx);
             cx.notify();
             return false;
         }
@@ -411,6 +416,7 @@ impl NotesView {
             window.push_notification(Notification::error("请先在设置中配置 AI"), cx);
             return false;
         };
+        let vision = AppState::global(cx).vision.clone();
         let requested_group = self.group_name_input.read(cx).value().trim().to_string();
         let requested_group = if self.import_group_selection_changed {
             self.selected_group_id
@@ -439,6 +445,7 @@ impl NotesView {
         self.import_cancelling = false;
         cx.notify();
         let content_input = self.content.clone();
+        let source_path_input = self.source_path_input.clone();
         let window_handle = self.window;
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<ImportEvent>();
         cx.spawn(
@@ -540,13 +547,40 @@ impl NotesView {
                         let report = move |event| {
                             let _ = progress_tx.send(event);
                         };
-                        let prepared = crate::ai::workflow::prepare_import_with_progress(
-                            &ai,
-                            &content,
-                            &report,
-                            &task_cancellation,
-                        )
-                        .await?;
+                        let prepared = if source_path.is_empty() {
+                            crate::ai::workflow::prepare_import_with_progress(
+                                &ai,
+                                &content,
+                                &report,
+                                &task_cancellation,
+                            )
+                            .await?
+                        } else {
+                            report(ImportEvent::Stage(ImportProgress::stage(
+                                ImportStage::Preparing,
+                                format!("正在扫描本地来源 {source_path}"),
+                            )));
+                            let scan_path = source_path.clone();
+                            let mut source = tokio::task::spawn_blocking(move || {
+                                crate::ai::source::scan_path(scan_path)
+                            })
+                            .await
+                            .map_err(|error| anyhow::anyhow!("本地扫描任务失败: {error}"))??;
+                            if !content.trim().is_empty() {
+                                source.text.push_str(
+                                    "\n\n<!-- ruiz-source: manual-input -->\n# 手动补充内容\n\n",
+                                );
+                                source.text.push_str(content.trim());
+                            }
+                            crate::ai::workflow::prepare_source_bundle_with_progress(
+                                &ai,
+                                vision.as_ref(),
+                                source,
+                                &report,
+                                &task_cancellation,
+                            )
+                            .await?
+                        };
                         task_cancellation.begin_persistence()?;
                         report(ImportEvent::Stage(ImportProgress::stage(
                             ImportStage::Saving,
@@ -572,6 +606,8 @@ impl NotesView {
                             );
                             cx.update_window(window_handle, move |_view, window, cx| {
                                 content_input.update(cx, |s, cx| s.set_value("", window, cx));
+                                source_path_input
+                                    .update(cx, |s, cx| s.set_value("", window, cx));
                             })
                             .ok();
                             this.update(&mut cx, |this, cx| {
@@ -1080,6 +1116,7 @@ impl NotesView {
 
     fn open_import_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let content = self.content.clone();
+        let source_path_input = self.source_path_input.clone();
         self.import_group_selection_changed = false;
         let group_name_input = self.group_name_input.clone();
         if let Some(group) = self
@@ -1143,6 +1180,7 @@ impl NotesView {
                 }
             })
             .detach();
+            let source_path_for_picker = source_path_input.clone();
             sheet
                 .overlay(true)
                 .overlay_closable(true)
@@ -1196,6 +1234,62 @@ impl NotesView {
                         )
                         .child(
                             v_flex()
+                                .gap_1()
+                                .child(div().text_sm().font_medium().child("本地来源"))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .child(Input::new(&source_path_input).h(px(36.)).flex_1())
+                                        .child(
+                                            Button::new("pick-import-source")
+                                                .icon(IconName::FolderOpen)
+                                                .label("选择")
+                                                .outline()
+                                                .on_click(move |_, window, cx| {
+                                                    let receiver = cx.prompt_for_paths(
+                                                        gpui::PathPromptOptions {
+                                                            files: true,
+                                                            directories: true,
+                                                            multiple: false,
+                                                            prompt: Some("选择学习资料或目录".into()),
+                                                        },
+                                                    );
+                                                    let input = source_path_for_picker.clone();
+                                                    window
+                                                        .spawn(cx, async move |cx| {
+                                                            let Ok(Ok(Some(mut paths))) =
+                                                                receiver.await
+                                                            else {
+                                                                return Ok::<(), anyhow::Error>(());
+                                                            };
+                                                            let Some(path) = paths.pop() else {
+                                                                return Ok(());
+                                                            };
+                                                            cx.update(|window, cx| {
+                                                                input.update(cx, |state, cx| {
+                                                                    state.set_value(
+                                                                        path.to_string_lossy(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            })?;
+                                                            Ok(())
+                                                        })
+                                                        .detach();
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("递归扫描文本、Markdown、网页、代码和图片；图像模型留空时图片不会被读取或上传。"),
+                                ),
+                        )
+                        .child(
+                            v_flex()
                                 .min_h_0()
                                 .flex_1()
                                 .gap_1()
@@ -1205,7 +1299,7 @@ impl NotesView {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("单次最多 300,000 个字符，可以包含网页菜单、目录和多篇文章。"),
+                                        .child("支持超长分块处理；也可以在扫描本地来源时补充这段文本。"),
                                 )
                                 .child(
                                     div()
@@ -1996,8 +2090,11 @@ impl Render for NotesView {
                     )
                     .child(
                         div().w_full().text_color(colors.foreground).child(
-                            markdown(note.map(|note| note.content.clone()).unwrap_or_default())
-                                .selectable(true),
+                            markdown_with_local_images(
+                                "notes-reader-content",
+                                note.map(|note| note.content.clone()).unwrap_or_default(),
+                            )
+                            .selectable(true),
                         ),
                     )
                     .into_any_element()

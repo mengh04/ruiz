@@ -31,6 +31,7 @@ use crate::{
     },
     settings::{AppSettings, save_config},
     state::AppState,
+    ui::components::markdown_with_local_images,
     ui::notifications,
 };
 
@@ -884,7 +885,7 @@ impl LearningView {
                     .gap_5()
                     .children(blocks.into_iter().map(|block| {
                         div().text_color(colors.foreground).child(
-                            TextView::markdown(
+                            markdown_with_local_images(
                                 format!("learning-source-{}", block.local_id),
                                 block.source_text,
                             )
