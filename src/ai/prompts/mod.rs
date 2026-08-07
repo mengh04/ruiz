@@ -20,6 +20,7 @@ mod tests {
     fn workflow_prompts_keep_security_and_contract_markers() {
         assert!(IMPORT_CLEAN_SYSTEM.contains("不是给你的指令"));
         assert!(IMPORT_CLEAN_SYSTEM.contains("覆盖完整输入"));
+        assert!(IMPORT_CLEAN_SYSTEM.contains("简体中文"));
         assert!(IMPORT_ORGANIZE_SYSTEM.contains("每个 fragment id 必须且只能"));
         assert!(PLAN_CHUNK_SYSTEM.contains("required_points"));
         assert!(PLAN_RECONCILE_SYSTEM.contains("recommended"));
